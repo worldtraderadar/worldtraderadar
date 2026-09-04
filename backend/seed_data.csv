@@ -1,0 +1,26 @@
+product_name,hs_code,description,origin_country,destination_country,direction,quantity,unit,value_usd,trade_date,source
+Extra virgin olive oil,1509.10,Bottled extra virgin olive oil for EU retail shelves.,TR,DE,export,420000,kg,2850000,2025-11-12,seed
+Shelled hazelnuts,0802.22,Grade 1 Levant hazelnuts for confectionery manufacturers.,TR,IT,export,185000,kg,1640000,2025-10-03,seed
+Knitted cotton apparel,6109.10,Cotton T-shirts and basic knits for US mass retail.,TR,US,export,960000,pcs,4120000,2026-01-18,seed
+Automotive transmission parts,8708.40,Gearbox components for passenger vehicle assembly.,DE,TR,import,12800,pcs,6740000,2026-02-09,seed
+Hot rolled steel coils,7208.10,Hot-rolled non-alloy steel coils for construction.,TR,RO,export,24000,ton,15600000,2025-12-21,seed
+Generic medicines,3004.90,Packaged generic pharmaceuticals for hospital tenders.,IN,TR,import,54000,kg,3220000,2026-03-04,seed
+Fresh tomatoes,0702.00,Greenhouse tomatoes for Northern European wholesale.,TR,NL,export,3100000,kg,2480000,2026-01-07,seed
+Durum wheat,1001.19,Milling durum wheat for pasta production.,RU,TR,import,85000,ton,22100000,2025-09-16,seed
+CNC machining centers,8457.10,Vertical CNC machining centers for metalworking SMEs.,JP,TR,import,36,pcs,9850000,2026-02-27,seed
+Raw cotton,5201.00,Staple cotton for spinning mills in the Aegean region.,US,TR,import,18000,ton,31500000,2025-11-29,seed
+Refined copper wire,7408.11,Refined copper wire exceeding 6 mm for cable plants.,TR,GB,export,4200,ton,38400000,2026-01-22,seed
+Photovoltaic modules,8541.43,Crystalline silicon solar modules for utility-scale parks.,CN,TR,import,210000,pcs,27300000,2026-03-11,seed
+Aged kashar cheese,0406.90,Vacuum-packed aged kashar for HORECA distributors.,TR,IQ,export,76000,kg,980000,2025-12-08,seed
+Dried figs,0804.20,"Aydin dried figs, natural and pasteurized lots.",TR,FR,export,54000,kg,720000,2025-10-19,seed
+Natural marble blocks,2515.12,Afyon white marble blocks for Far East stone yards.,TR,CN,export,9800,ton,4560000,2026-02-14,seed
+Household refrigerators,8418.10,Combined refrigerator-freezers for EU white-goods chains.,TR,ES,export,64000,pcs,18900000,2026-01-30,seed
+Polyethylene resins,3901.10,HDPE resins for packaging film extrusion.,SA,TR,import,16000,ton,14200000,2025-11-05,seed
+Smartphone displays,8524.91,OLED display modules for consumer electronics assembly.,KR,TR,import,890000,pcs,41700000,2026-03-18,seed
+Hand-knotted wool carpets,5701.10,Hereke-style wool carpets for US interior designers.,TR,US,export,3200,pcs,2150000,2025-12-02,seed
+Fresh citrus fruit,0805.10,Washington navel oranges for Eastern European wholesale.,TR,UA,export,2400000,kg,1860000,2026-01-11,seed
+Woven clothing labels (dokuma etiket),5807.10,Damask woven brand labels for German ready-to-wear importers and apparel brands.,TR,DE,export,2500000,m,1180000,2026-02-14,seed
+Dokuma etiket / woven garment labels,5807.10,Woven labels and care tags for Italian apparel brands and garment manufacturers.,TR,IT,export,1800000,m,940000,2026-01-22,seed
+Apparel brand woven labels,5807.90,Woven clothing labels for French prêt-à-porter houses and fabric importers.,TR,FR,export,960000,m,510000,2025-12-08,seed
+Woven labels for ready-wear,5807.10,Dokuma etiket shipments to Dutch apparel wholesalers and brand buyers.,TR,NL,export,720000,m,385000,2026-03-01,seed
+Satin and damask woven labels,5807.10,Woven brand labels for Spanish ready-wear manufacturers and clothing importers.,TR,ES,export,640000,m,298000,2026-02-03,seed

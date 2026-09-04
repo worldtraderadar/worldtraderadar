@@ -1,0 +1,7 @@
+# Yerel GPU TTS (Coqui XTTS). Python 3.12–3.14 + CUDA önerilir.
+# pip install -r requirements-tts.txt
+# İlk XTTS indirmesi için COQUI_TOS_AGREED=1 (tts_local.py setdefault yapar).
+coqui-tts[codec]>=0.27.5
+transformers>=4.57,<5
+torch
+torchaudio
