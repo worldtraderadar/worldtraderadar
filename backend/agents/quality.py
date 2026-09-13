@@ -143,12 +143,38 @@ class QualitySnapshot:
         }
 
 
+_FALLBACK_PATHS = frozenset(
+    {
+        "COMMERCIAL_FALLBACK",
+        "PLAYBOOK_FALLBACK",
+        "REJECTED_NO_SAFE_RESPONSE",
+    }
+)
+_PII_LOG_KEYS = frozenset(
+    {
+        "thinking",
+        "raw_thinking",
+        "message",
+        "prompt",
+        "response",
+        "advice",
+        "question",
+        "text",
+        "wav",
+        "user_text",
+        "assistant_text",
+        "history",
+        "context",
+    }
+)
+
 _BOOK: list[ComposeTrace] = []
 _LAST_INFERENCE: dict = {}
 _ROUTE: list[dict] = []
 _CANARY: list[dict] = []
 _LAST_TTS: dict = {}
 _LAST_MODEL: str = ""
+_LAST_CONSULT_LOG: dict = {}
 
 
 def reset_quality() -> None:
@@ -158,6 +184,7 @@ def reset_quality() -> None:
     _ROUTE.clear()
     _CANARY.clear()
     _LAST_TTS.clear()
+    _LAST_CONSULT_LOG.clear()
     _LAST_MODEL = ""
     from .shadow import reset_shadow
 
@@ -228,6 +255,139 @@ def record_canary_turn(meta: dict) -> None:
 
 def canary_turns() -> list[dict]:
     return list(_CANARY)
+
+
+def last_consult_log_telemetry() -> dict:
+    """Last persistable consult fields for agent_logs.output. No PII text."""
+    return dict(_LAST_CONSULT_LOG)
+
+
+def persistable_consult_telemetry(
+    *,
+    reasoning_model: str,
+    canary_qwen: bool,
+    validator_result: str = "",
+    retry: str = "",
+    compose_path: str = "",
+    latency_s: float | None = None,
+    cmo_total: int | None = None,
+    decision: int | None = None,
+    false_certainty: bool = False,
+    unsupported_fact: bool = False,
+    brief_echo: bool = False,
+    session_id: str | None = None,
+) -> dict:
+    """Durable consult metrics for agent_logs.output.
+
+    decision is the existing CMO DECISION dimension (0–2), not a new classifier.
+    latency_ms is Ollama/model wall time. Pipeline duration stays duration_ms.
+    chat_model is never copied into reasoning_model.
+    """
+    latency_ms = None
+    if isinstance(latency_s, (int, float)):
+        latency_ms = int(round(float(latency_s) * 1000))
+    payload = {
+        "reasoning_model": reasoning_model or "",
+        "canary_qwen": bool(canary_qwen),
+        "model_path": "canary" if canary_qwen else "default",
+        "validator_result": validator_result or "",
+        "retry": retry or "",
+        "fallback": compose_path in _FALLBACK_PATHS,
+        "latency_ms": latency_ms,
+        "cmo_total": cmo_total,
+        "decision": decision,
+        "false_certainty": bool(false_certainty),
+        "unsupported_fact": bool(unsupported_fact),
+        "brief_echo": bool(brief_echo),
+        "session_id": session_id or "",
+    }
+    return {k: v for k, v in payload.items() if k not in _PII_LOG_KEYS and k != "chat_model"}
+
+
+def record_consult_quality(
+    *,
+    session_id: str,
+    assigned: str | None,
+    advice: str,
+    question: str,
+) -> dict:
+    """Score existing CMO/validator traces and stash persistable consult telemetry.
+
+    Does not change evaluator/validator. Does not store prompt or advice.
+    """
+    from .evaluator import score_cmo_v51
+    from llm import canary_bucket, reasoning_model
+
+    inf = last_inference()
+    book = traces()
+    trace = book[-1] if book else None
+    scored = score_cmo_v51(advice or "", question=question)
+    model = inf.get("model") or assigned or reasoning_model()
+    path = getattr(trace, "path", "") if trace else ""
+    validator_result = getattr(trace, "direct_status", "") if trace else ""
+    retry = getattr(trace, "retry_status", "") if trace else ""
+    record_canary_turn(
+        {
+            "model": model,
+            "task": inf.get("task") or "commercial",
+            "session_id": session_id or "",
+            "session_bucket": canary_bucket(session_id) if session_id else None,
+            "canary_qwen": bool(assigned),
+            "latency_s": inf.get("latency_s"),
+            "prompt_eval_s": inf.get("prompt_eval_s"),
+            "generation_s": inf.get("gen_s"),
+            "load_s": inf.get("load_s"),
+            "tokens": inf.get("eval_count"),
+            "tokens_per_sec": inf.get("tokens_per_sec"),
+            "done_reason": inf.get("done_reason") or "",
+            "validator_first_shot": validator_result,
+            "retry": retry,
+            "final_path": path,
+            "cmo_score": scored.total,
+            "decision": scored.decision,
+            "BRIEF_ECHO": scored.brief_echo,
+            "ENGLISH": scored.english_leakage,
+            "FALSE_CERTAINTY": scored.false_certainty,
+            "UNSUPPORTED_FACT": scored.unsupported_fact,
+            "MEMORY_DISHONESTY": scored.memory_dishonesty,
+            "PROMPT_LEAK": scored.prompt_leak,
+            "tts_latency_s": last_tts().get("latency_s"),
+            "model_switch": inf.get("model_switch") or "",
+            "thinking_length": inf.get("thinking_length") or 0,
+            "content_empty": not bool((inf.get("content_length") or 0)),
+        }
+    )
+    payload = persistable_consult_telemetry(
+        reasoning_model=str(model or ""),
+        canary_qwen=bool(assigned),
+        validator_result=validator_result,
+        retry=retry,
+        compose_path=path,
+        latency_s=inf.get("latency_s"),
+        cmo_total=scored.total,
+        decision=scored.decision,
+        false_certainty=scored.false_certainty,
+        unsupported_fact=scored.unsupported_fact,
+        brief_echo=scored.brief_echo,
+        session_id=session_id,
+    )
+    _LAST_CONSULT_LOG.clear()
+    _LAST_CONSULT_LOG.update(payload)
+    return payload
+
+
+def merge_consult_log_output(base: dict, telemetry: dict | None = None) -> dict:
+    """Attach persistable metrics without overwriting public chat_model."""
+    out = dict(base or {})
+    tel = dict(telemetry if telemetry is not None else _LAST_CONSULT_LOG)
+    tel.pop("chat_model", None)
+    for key in _PII_LOG_KEYS:
+        tel.pop(key, None)
+    reasoning = tel.get("reasoning_model")
+    out.update(tel)
+    if reasoning is not None:
+        out["reasoning_model"] = reasoning
+    return out
 
 
 def canary_snapshot() -> dict:

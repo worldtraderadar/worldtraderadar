@@ -8,6 +8,7 @@ from prompts import INTAKE_REPLY, is_general_intake
 from .context_pack import build_context_pack
 from .response_engine import compose_consultant_reply, should_reason
 from .retrieve import (
+    active_retrieval_product,
     enrich_matches_for_product,
     gather_match_rows,
     retrieval_query,
@@ -71,7 +72,7 @@ async def _run_party_finder(
         deps.session.last_ask = None
         apply_utterance_slots(deps.session, question)
 
-    product = deps.session.product if deps.session is not None else None
+    product = active_retrieval_product(deps.session, question) or None
     if not extract_product_slot(product):
         product = extract_product_slot(question)
         if product and deps.session is not None and not deps.session.product:
@@ -130,7 +131,7 @@ async def _run_party_finder(
         question=question,
         extra_tools=tools,
     )
-    if should_reason(question) and matches is not None:
+    if should_reason(question, focus="matching") and matches is not None:
         no_hits = (
             "Veritabanında eşleşen firma yok. İsim uydurma. "
             "Bulunamadığını açıkça söyle, sonra hedef segment öner."

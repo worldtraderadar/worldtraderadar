@@ -58,7 +58,7 @@ async def build_context_pack(
         limit=6,
     )
     return ContextPack(
-        session_notes=session_notes(session),
+        session_notes=session_notes(session, question=question),
         company=format_profile(profile),
         memories=memories,
         tools=list(extra_tools or []),

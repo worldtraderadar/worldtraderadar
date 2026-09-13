@@ -121,7 +121,7 @@ class CommercialIntelligenceTests(ScenarioMixin, unittest.TestCase):
             brief.mode == "decision"
             and "düşürmez" in low
             and "marj" in low
-            and "sonraki adım" in low
+            and "teklif" in low
         )
         self.report(q, "Net duruş: fiyatı hemen düşürme; marjı ölç; sonraki adım ver", reply, ok)
 

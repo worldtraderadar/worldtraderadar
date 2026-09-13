@@ -35,7 +35,11 @@ async def run_orchestrator(
     on_step: StepCallback | None = None,
 ) -> tuple[str | None, AgentOutcome]:
     steps: list[AgentStep] = []
-    run_id = await create_agent_run(deps.supabase, question)
+    run_id = await create_agent_run(
+        deps.supabase,
+        question,
+        account_id=getattr(deps, "account_id", None) or None,
+    )
 
     async def emit(step: AgentStep) -> None:
         for index, existing in enumerate(steps):

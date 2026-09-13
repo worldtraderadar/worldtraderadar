@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Literal
 
-from prompts import is_draft_request, looks_english
+from prompts import is_draft_request, looks_english, strip_internal_output
 
 from .commercial import is_false_confidence, is_weak_decision, treats_score_as_win
 from .quality_flags import (
@@ -23,7 +23,7 @@ _EN_LEAD = re.compile(
     r"(?i)^(i\s+|as the\s+|sure\b|of course\b|let'?s\b|hello\b|i understand\b|dear\b|best regards\b)"
 )
 _TRADE_TERMS = {
-    "b2b", "b2c", "b2b2c", "hs", "moq", "fob", "cif", "exw", "dap", "ddp",
+    "b2b", "b2c", "b2b2c", "hs", "moq", "fob", "cif", "exw", "fca", "dap", "ddp",
     "oem", "sku", "crm", "kpi", "cac", "roi", "incoterms", "linkedin",
     "pdf", "csv", "excel", "http", "https", "www", "url", "api", "eori",
     "nace", "cn", "gtip", "pla", "petg", "fdm", "iso", "ce",
@@ -94,6 +94,14 @@ _ROBOT_OPEN = re.compile(
     r"size yardımcı olmaktan (mutluluk|memnuniyet)|"
     r"tabii ki[,.]?\s*size|"
     r"elbette[,.]?\s*(size )?yardımcı"
+    r")"
+)
+_INVENTED_CAPACITY = re.compile(
+    r"(?i)("
+    r"kapasite(?:miz|niz|si)?\s*[:=]?\s*\d+|"
+    r"capacity\s*[:=]?\s*\d+|"
+    r"kapasite(?:miz|niz)?\s+\d+\s*(adet|ton|metre|mt|unit)|"
+    r"monthly\s+capacity\s+\d+"
     r")"
 )
 _EN_PASSAGE = re.compile(r"(?<![ğüşıöçĞÜŞİÖÇ])[A-Za-z][A-Za-z,'’ ]{72,}(?![ğüşıöçĞÜŞİÖÇ])")
@@ -240,6 +248,7 @@ def validate_response(
     facts: str = "",
     tools: list[ToolResult] | None = None,
     memories: list[str] | None = None,
+    capacity: str | None = None,
 ) -> ValidationResult:
     reasons: list[str] = []
     status: Verdict = "PASS"
@@ -257,6 +266,11 @@ def validate_response(
 
     if _MAIL_LEAK.search(body) and not is_draft_request(question):
         reasons.append("mail taslağı sızıntısı")
+        status = "REJECT"
+
+    # Unknown capacity: reject invented capacity quantities (known capacity OK).
+    if not (capacity and str(capacity).strip()) and _INVENTED_CAPACITY.search(body):
+        reasons.append("bilinmeyen kapasite uydurma")
         status = "REJECT"
 
     allowed = _haystack(
@@ -350,4 +364,5 @@ def make_speakable(text: str) -> str:
     body = re.sub(r"(?m)^\s*[-*]\s+", "", body)
     body = re.sub(r"(?m)^\s*\d+[.)]\s+", "", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
-    return re.sub(r"[ \t]{2,}", " ", body).strip()
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    return strip_internal_output(body)

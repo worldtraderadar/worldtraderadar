@@ -7,16 +7,29 @@ from supabase import AsyncClient
 from .types import AgentStep
 
 
-async def create_agent_run(supabase: AsyncClient, query: str) -> str | None:
+async def create_agent_run(
+    supabase: AsyncClient, query: str, *, account_id: str | None = None
+) -> str | None:
+    payload: dict[str, Any] = {"query": query, "status": "running", "steps": []}
+    if account_id:
+        payload["account_id"] = account_id
     try:
         result = await (
-            supabase.table("agent_runs")
-            .insert({"query": query, "status": "running", "steps": []})
-            .execute()
+            supabase.table("agent_runs").insert(payload).execute()
         )
         if result.data:
             return str(result.data[0]["id"])
     except Exception:
+        if "account_id" in payload:
+            payload.pop("account_id", None)
+            try:
+                result = await (
+                    supabase.table("agent_runs").insert(payload).execute()
+                )
+                if result.data:
+                    return str(result.data[0]["id"])
+            except Exception:
+                return None
         return None
     return None
 

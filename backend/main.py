@@ -1384,41 +1384,13 @@ def _consult_deps(
 def _record_canary_consult(
     session_id: str, assigned: str | None, outcome, question: str
 ) -> None:
-    from agents.evaluator import score_cmo_v51
-    from agents.quality import last_inference, last_tts, record_canary_turn, traces
+    from agents.quality import record_consult_quality
 
-    inf = last_inference()
-    book = traces()
-    trace = book[-1] if book else None
-    scored = score_cmo_v51(getattr(outcome, "advice", "") or "", question=question)
-    record_canary_turn(
-        {
-            "model": inf.get("model") or assigned or reasoning_model(),
-            "task": inf.get("task") or "commercial",
-            "session_bucket": canary_bucket(session_id) if session_id else None,
-            "canary_qwen": bool(assigned),
-            "latency_s": inf.get("latency_s"),
-            "prompt_eval_s": inf.get("prompt_eval_s"),
-            "generation_s": inf.get("gen_s"),
-            "load_s": inf.get("load_s"),
-            "tokens": inf.get("eval_count"),
-            "tokens_per_sec": inf.get("tokens_per_sec"),
-            "done_reason": inf.get("done_reason") or "",
-            "validator_first_shot": getattr(trace, "direct_status", "") if trace else "",
-            "retry": getattr(trace, "retry_status", "") if trace else "",
-            "final_path": getattr(trace, "path", "") if trace else "",
-            "cmo_score": scored.total,
-            "BRIEF_ECHO": scored.brief_echo,
-            "ENGLISH": scored.english_leakage,
-            "FALSE_CERTAINTY": scored.false_certainty,
-            "UNSUPPORTED_FACT": scored.unsupported_fact,
-            "MEMORY_DISHONESTY": scored.memory_dishonesty,
-            "PROMPT_LEAK": scored.prompt_leak,
-            "tts_latency_s": last_tts().get("latency_s"),
-            "model_switch": inf.get("model_switch") or "",
-            "thinking_length": inf.get("thinking_length") or 0,
-            "content_empty": not bool((inf.get("content_length") or 0)),
-        }
+    record_consult_quality(
+        session_id=session_id,
+        assigned=assigned,
+        advice=getattr(outcome, "advice", "") or "",
+        question=question,
     )
 
 
@@ -1489,25 +1461,15 @@ async def _run_consult_pipeline(
     )
 
 
-async def _log_consult_success(
-    supabase: AsyncClient,
-    body: ConsultRequest,
-    response: ConsultResponse,
-    started: float,
-    *,
-    account_id: str | None = None,
-) -> None:
-    input_data = body.model_dump(mode="json")
-    if account_id:
-        input_data["account_id"] = account_id
-        if response.session_id:
-            input_data["session_id"] = response.session_id
-    await log_agent(
-        supabase,
-        action="consult",
-        status="success",
-        input_data=input_data,
-        output_data={
+def _consult_success_output(body: ConsultRequest, response: ConsultResponse) -> dict[str, Any]:
+    from agents.quality import last_consult_log_telemetry, merge_consult_log_output
+
+    tel = last_consult_log_telemetry()
+    sid = response.session_id or getattr(body, "session_id", None) or tel.get("session_id") or ""
+    if sid:
+        tel["session_id"] = sid
+    return merge_consult_log_output(
+        {
             "question": response.question,
             "advice": response.advice,
             "context_count": len(response.context),
@@ -1529,6 +1491,29 @@ async def _log_consult_success(
                 for item in response.context
             ],
         },
+        tel,
+    )
+
+
+async def _log_consult_success(
+    supabase: AsyncClient,
+    body: ConsultRequest,
+    response: ConsultResponse,
+    started: float,
+    *,
+    account_id: str | None = None,
+) -> None:
+    input_data = body.model_dump(mode="json")
+    if account_id:
+        input_data["account_id"] = account_id
+        if response.session_id:
+            input_data["session_id"] = response.session_id
+    await log_agent(
+        supabase,
+        action="consult",
+        status="success",
+        input_data=input_data,
+        output_data=_consult_success_output(body, response),
         duration_ms=int((time.perf_counter() - started) * 1000),
         organization_id=body.organization_id,
         account_id=account_id,

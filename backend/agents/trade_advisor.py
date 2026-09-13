@@ -22,11 +22,13 @@ from prompts import (
     wants_web_research,
 )
 
+from .commercial import apply_commercial_guidance, build_commercial_situation
 from .contracts import company_miss_facts, current_data_facts, memory_miss_facts
 from .context_pack import build_context_pack
 from .documents import diagnostic_outline
 from .response_engine import compose_consultant_reply, fallback_web_unavailable, should_reason
 from .retrieve import (
+    active_retrieval_product,
     enrich_matches_for_product,
     gather_match_rows,
     retrieval_query,
@@ -82,7 +84,11 @@ async def run_trade_advisor(
         deps.session.last_ask = None
         apply_utterance_slots(deps.session, question)
 
-    product = deps.session.product if deps.session is not None else None
+    product = (
+        active_retrieval_product(deps.session, question)
+        if deps.session is not None
+        else None
+    )
     matches: list[Any] = []
     notes: list[str] = []
     skip_rag = is_memory_recall(question) or is_current_information(question) or is_stat_challenge(question) or is_company_data_ask(question) or (
@@ -139,7 +145,9 @@ async def run_trade_advisor(
     facts = with_domain_notes(
         advisor_answer(question, deps.session, matches),
         notes,
-        product=deps.session.product if deps.session is not None else product,
+        product=product or (
+            deps.session.product if deps.session is not None else None
+        ),
     )
     if is_diagnostic_request(question) and not matches:
         facts = diagnostic_outline(question)
@@ -179,7 +187,7 @@ async def run_trade_advisor(
             "Karar sorusu. Mail taslağı, fuar listesi veya kopyala-yapıştır teklif yazma. "
             "Firma ve fiyat uydurma."
         ]
-        notes_txt = session_notes(deps.session)
+        notes_txt = session_notes(deps.session, question=question)
         if notes_txt:
             bits.append(notes_txt)
         if matches:
@@ -197,7 +205,14 @@ async def run_trade_advisor(
     )
 
     gen_step = await step("advise", "Ticari değerlendirme")
-    focus = advisor_focus(question)
+    focus = advisor_focus(question, deps.session)
+    # V5.18.5 Phase 1–2: derived commercial context + controlled user-facing guidance.
+    situation = build_commercial_situation(
+        question,
+        session=deps.session,
+        focus=focus,
+    )
+    setattr(deps, "commercial_situation", situation)
     if should_reason(question, focus):
         advice = await compose_consultant_reply(
             generate=deps.generate,
@@ -209,9 +224,18 @@ async def run_trade_advisor(
             task=getattr(deps, "goal", "") or focus,
             session=deps.session,
             matches=matches,
+            situation=situation,
+            focus=focus,
         )
     else:
         advice = facts
+    advice = apply_commercial_guidance(
+        advice,
+        situation,
+        question,
+        session=deps.session,
+        focus=focus,
+    )
     web = next((item for item in tools if item.name == "web_search"), None)
     if web is not None and not web.ok and wants_web_research(question):
         if "uydur" not in advice.casefold() and "tamamlayamadım" not in advice.casefold():

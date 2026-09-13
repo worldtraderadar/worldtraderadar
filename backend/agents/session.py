@@ -14,12 +14,17 @@ from uuid import uuid4
 
 from prompts import (
     INTAKE_REPLY,
+    TRADE_DOCS_REPLY,
+    TRADE_DOCS_SUPPORT,
     advisor_focus,
+    is_customer_find_ask,
     is_draft_request,
     is_general_intake,
     is_language_barrier,
     is_method_question,
+    is_mixed_commercial_start,
     is_strategy_request,
+    is_trade_docs_ask,
 )
 
 AskSlot = Literal["name", "product", "choice"] | None
@@ -48,12 +53,21 @@ _ANALYZE_PICK = re.compile(
 )
 
 _PRODUCTISH = re.compile(
-    r"(?i)(etiket|dokuma|kuma[sş]|iplik|tekstil|makine|mobilya|"
-    r"g[iı]da|deri|ayakkab[iı]|[uü]r[uü]n|iplik|seramik|zeytin|"
+    r"(?i)(etiket|dokuma|woven|\bcotton\b|\blabels?\b|"
+    r"kuma[sş]|iplik|tekstil|makine|mobilya|"
+    r"g[iı]da|\bderi\b|ayakkab[iı]|iplik|seramik|zeytin|"
     r"f[iı]nd[iı]k|haz[iı]r\s*giyim|ambalaj|plastik|metal|"
     r"çelik|celik|\bsteel\b|demir|"
     r"oyuncak|filament|\bpla\b|\bpetg\b|yaz[iı]c[iı]|maket|"
-    r"3[\s\-]?d|bask[iı])"
+    r"3[\s\-]?d|bask[iı]|karton)"
+)
+_PRODUCT_SWITCH_MARK = re.compile(r"(?i)\byerine\b")
+_QUERY_LEFTOVER = re.compile(
+    r"(?i)^("
+    r"nas[ıi]l|nereden|kimlere|hangi|hakk[ıi]nda|"
+    r"satabilirim|ihra[cç]|ihracat|ithalat|bulabilirim|"
+    r"bilgi|ederim|yapabilirim"
+    r")\b"
 )
 _DIGIT = re.compile(r"\d")
 
@@ -76,6 +90,10 @@ def looks_like_product(text: str) -> bool:
     body = (text or "").strip()
     if not body:
         return False
+    if _is_deictic_product_label(body) or is_deictic_product_reference(body):
+        stripped = _DEICTIC_PRODUCT.sub(" ", body)
+        if not _PRODUCTISH.search(stripped):
+            return False
     if _PRODUCTISH.search(body):
         return True
     if _DIGIT.search(body) and len(body.split()) <= 6:
@@ -102,6 +120,8 @@ _PRODUCT_STOP = {
     "hizmet",
     "the",
     "and",
+    "etiket",
+    "label",
 }
 
 _PRINT3D_HINT = re.compile(
@@ -118,7 +138,7 @@ _STEEL_HINT = re.compile(
 def product_kind(product: str | None) -> str:
     """woven | print3d | steel | generic — sektör karışmasın."""
     low = _fold(product or "")
-    if any(word in low for word in ("etiket", "dokuma", "label")):
+    if any(word in low for word in ("etiket", "dokuma", "label", "tekstil", "textile")):
         return "woven"
     if _PRINT3D_HINT.search(product or ""):
         return "print3d"
@@ -139,6 +159,88 @@ def is_product_switch(old: str | None, new: str | None) -> bool:
     ta = {tok for tok in re.findall(r"[a-z0-9]{3,}", a) if tok not in _PRODUCT_STOP}
     tb = {tok for tok in re.findall(r"[a-z0-9]{3,}", b) if tok not in _PRODUCT_STOP}
     return bool(ta and tb) and not (ta & tb)
+
+
+_DEICTIC_PRODUCT = re.compile(
+    r"(?i)\b(?:bu|şu|o)\s+"
+    r"[uü]r[uü]n"
+    r"(?:ler[ıiuü]?|lar[ıiuü]?)?"
+    r"(?:"
+    r"[dt][ae]n|"
+    r"[dt][ae]|"
+    r"l[ae]|"
+    r"[uü]n|"
+    r"[ıi]n|"
+    r"[uü]|"
+    r"[ıi]|"
+    r"[ae]"
+    r")?"
+    r"(?:\s+(?:ile|i[cç]in|hakk[ıi]nda))?"
+    r"\b"
+)
+
+
+def is_deictic_product_reference(text: str | None) -> bool:
+    """«Bu ürünü / bu ürüne / bu ürün için» mevcut ürüne işarettir."""
+    body = (text or "").strip()
+    if not body:
+        return False
+    if _DEICTIC_PRODUCT.search(body):
+        return True
+    folded = _fold(body)
+    return folded in {"urun", "bu urun", "su urun", "o urun"}
+
+
+def _is_deictic_product_label(label: str | None) -> bool:
+    """Slot veya kısa etiket deiktik referans mı."""
+    body = (label or "").strip()
+    if not body:
+        return False
+    if is_deictic_product_reference(body):
+        return True
+    folded = _fold(body)
+    return folded.startswith("bu urun") or folded.startswith("su urun") or folded.startswith(
+        "o urun"
+    )
+
+
+def _is_sector_signal_not_sku(label: str | None) -> bool:
+    """«tekstil» sektör sinyalidir; dokuma etiket gibi SKU değildir."""
+    folded = _fold(label or "")
+    if not folded:
+        return False
+    if any(word in folded for word in ("etiket", "dokuma", "label")):
+        return False
+    return "tekstil" in folded or "textile" in folded
+
+
+def utterance_product(text: str | None) -> str | None:
+    """Current utterance'taki açık ürün. İşaret zamiri («bu ürün») yok sayılır.
+
+    «Tekstil hakkında bilgi» sektör sinyalidir; ürün adına yazılmaz.
+    """
+    slot = extract_product_slot(text)
+    if not slot or _is_deictic_product_label(slot) or _is_sector_signal_not_sku(slot):
+        return None
+    if is_deictic_product_reference(slot):
+        return None
+    return slot
+
+
+def stale_session_product_conflict(session_product: str | None, question: str) -> bool:
+    """Session ürünü ile current question farklı domain/product ise True.
+
+    Generic devam («bu ürün için belgeler») conflict değildir.
+    """
+    stale = (session_product or "").strip()
+    if not stale:
+        return False
+    incoming = utterance_product(question)
+    if incoming and is_product_switch(stale, incoming):
+        return True
+    q_kind = product_kind(question)
+    s_kind = product_kind(stale)
+    return q_kind != "generic" and q_kind != s_kind
 
 
 _UTTERANCE_NOISE = re.compile(
@@ -199,17 +301,38 @@ def extract_product_slot(text: str | None) -> str | None:
     raw = (text or "").strip()
     if not raw:
         return None
+    # «A yerine B» → yeni ürün B (eski SKU'yu kilitleme).
+    switch_parts = _PRODUCT_SWITCH_MARK.split(raw, maxsplit=1)
+    if len(switch_parts) == 2 and switch_parts[1].strip():
+        right = extract_product_slot(switch_parts[1].strip())
+        if right:
+            return right
     known = _KNOWN_PRODUCT.search(raw)
     if known:
         return re.sub(r"\s+", " ", known.group(1)).strip()
-    body = strip_query_noise(raw)
+    stripped = _DEICTIC_PRODUCT.sub(" ", raw)
+    body = strip_query_noise(stripped)
     if not body:
+        return None
+    if _is_deictic_product_label(body) or is_deictic_product_reference(body):
+        return None
+    leftover = _DEICTIC_PRODUCT.sub(" ", body)
+    if (
+        is_deictic_product_reference(raw) or _DEICTIC_PRODUCT.search(body)
+    ) and not _PRODUCTISH.search(leftover):
         return None
     if len(body.split()) > 6:
         return None
     if looks_like_capacity(body) or looks_like_stock(body):
         return None
-    if not looks_like_product(body) and not looks_like_product(raw):
+    if not looks_like_product(body):
+        return None
+    # «nasıl ihraç ederim» gibi soru artığı SKU değildir.
+    if _QUERY_LEFTOVER.search(body) and not re.search(
+        r"(?i)(etiket|dokuma|woven|\blabels?\b|karton|zeytin|çelik|celik|\bsteel\b|"
+        r"oyuncak|3[\s\-]?d)",
+        body,
+    ):
         return None
     return body
 
@@ -273,6 +396,11 @@ def wants_toy_event_notes(product: str | None) -> bool:
 def _incoming_product(text: str, stripped: str | None) -> str | None:
     body = (text or "").strip()
     leftover = (stripped or "").strip()
+    slotted = utterance_product(body) or utterance_product(leftover)
+    if slotted:
+        return slotted
+    if is_deictic_product_reference(body) and not _KNOWN_PRODUCT.search(body):
+        return None
     if looks_like_stock(body) or looks_like_capacity(body):
         candidate = clean_product_name(leftover)
         if (
@@ -292,8 +420,8 @@ def apply_utterance_slots(session: SessionState, text: str) -> bool:
     """Yeni ürün gelince eski ürün/stok/kapasiteyi sil. Switch olduysa True."""
     product, capacity, stock = split_product_and_volume(text)
     incoming = _incoming_product(text, product)
-    switched = bool(incoming and is_product_switch(session.product, incoming))
-    if switched and incoming:
+    switched = stale_session_product_conflict(session.product, text)
+    if switched:
         session.product = incoming
         session.capacity = capacity
         session.stock = stock
@@ -490,11 +618,7 @@ def format_capacity(raw: str) -> str:
     parsed = parse_capacity(raw)
     if parsed:
         return parsed["canonical"]
-    text = re.sub(r"\s+", " ", (raw or "").strip())
-    text = re.sub(r"(?i)\bmt\b", "metre", text)
-    if text and not re.search(r"(?i)(ayda|ayl[ıi]k|günlük|gunluk|yıllık|yillik)", text):
-        text = f"Aylık {text}"
-    return text
+    return ""
 
 
 def capacity_reminder(product: str | None, capacity: str | None) -> str:
@@ -548,7 +672,7 @@ def classify_option_pick(
     text = (question or "").strip()
     if not text or looks_like_capacity(text):
         return None
-    if is_strategy_request(text) or is_method_question(text) or is_language_barrier(text) or is_draft_request(text):
+    if is_strategy_request(text) or is_method_question(text) or is_language_barrier(text) or is_draft_request(text) or is_trade_docs_ask(text):
         return "trade_advisor"
     if is_buyer_like(text):
         return "buyer_finder"
@@ -624,7 +748,10 @@ def _pretty_country(raw: str) -> str | None:
     return code
 
 
-def markets_from_matches(matches: list[Any], fallback: tuple[str, str] = ("Almanya", "İtalya")) -> list[str]:
+def markets_from_matches(
+    matches: list[Any], fallback: tuple[str, ...] = ()
+) -> list[str]:
+    """Match ülkeleri. İkinci ülke uydurma / İtalya pad yok."""
     counts: dict[str, int] = {}
     for item in matches or []:
         dest = _pretty_country(
@@ -644,12 +771,17 @@ def markets_from_matches(matches: list[Any], fallback: tuple[str, str] = ("Alman
             if origin:
                 counts[origin] = counts.get(origin, 0) + 1
     ranked = [name for name, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
-    picked = ranked[:2] or list(fallback)
-    if len(picked) == 1:
-        extra = next((name for name in fallback if name not in picked), None)
-        if extra:
-            picked.append(extra)
-    return picked[:2]
+    if ranked:
+        return ranked[:1]
+    return list(fallback)[:1]
+
+
+def _market_phrase(market_a: str, market_b: str | None = None) -> str:
+    a = (market_a or "").strip() or "hedef pazar"
+    b = (market_b or "").strip()
+    if b and _fold(b) != _fold(a):
+        return f"{a} ve {b}"
+    return a
 
 
 def party_action_reply(
@@ -687,6 +819,7 @@ def _advisor_frame(
     capacity: str | None,
     matches: list[Any] | None,
     stock: str | None = None,
+    session_market: str | None = None,
 ) -> tuple[str, str, str, str]:
     label = display_product(product)
     if stock and capacity:
@@ -697,8 +830,14 @@ def _advisor_frame(
         reminder = capacity_reminder(label, capacity)
     else:
         reminder = _short_label(label)
-    markets = markets_from_matches(matches or [])
-    market_a, market_b = (markets + ["Almanya", "İtalya"])[:2]
+    # session.market authoritative; RAG ikinci ülke / İtalya pad yok.
+    pinned = (session_market or "").strip()
+    if pinned:
+        market_a, market_b = pinned, ""
+    else:
+        markets = markets_from_matches(matches or [])
+        market_a = markets[0] if markets else "hedef pazar"
+        market_b = ""
     kind = product_kind(product)
     return reminder, market_a, market_b, kind
 
@@ -749,31 +888,13 @@ def _match_org_name(item: Any) -> str:
 
 
 def match_firm_label(item: Any) -> str:
-    org = _match_org_name(item)
-    if org:
-        return org
-    product = str(_match_get(item, "product_name") or "").strip()
-    dest = _pretty_country(str(_match_get(item, "destination_country") or ""))
-    if dest and product:
-        short = re.sub(r"\s+", " ", product)
-        if len(short) > 36:
-            short = short[:34].rstrip() + "…"
-        return f"{dest} alıcısı · {short}"
-    if dest:
-        return f"{dest} alıcısı"
-    return product or "eşleşen alıcı"
+    """Yalnızca gerçek organization_name. Ülke alıcısı uydurma yok."""
+    return _match_org_name(item)
 
 
 def match_firm_addressee(item: Any) -> str:
-    """Mail hitabı: firma adı, yoksa ülke alıcısı (kırpma yok)."""
-    org = _match_org_name(item)
-    if org:
-        return org
-    dest = _pretty_country(str(_match_get(item, "destination_country") or ""))
-    if dest:
-        return f"{dest} alıcısı"
-    product = str(_match_get(item, "product_name") or "").strip()
-    return product or "Purchasing Team"
+    """Mail hitabı: yalnızca gerçek firma adı."""
+    return _match_org_name(item)
 
 
 def match_firm_labels(matches: list[Any] | None, limit: int = 4) -> list[str]:
@@ -921,6 +1042,7 @@ def advisor_mediate_reply(
     capacity: str | None = None,
     matches: list[Any] | None = None,
     stock: str | None = None,
+    session_market: str | None = None,
 ) -> str:
     """Direktör emri: eşleşme + fiyat + kanal + şart. Soru yok."""
     kind = product_kind(product)
@@ -942,13 +1064,14 @@ def advisor_mediate_reply(
                 "kartlarda açıldı."
             )
         _reminder, market_a, market_b, _kind = _advisor_frame(
-            product, capacity, matches, stock=stock
+            product, capacity, matches, stock=stock, session_market=session_market
         )
+        market = _market_phrase(market_a, market_b)
         book = _price_playbook(kind, has_stock=bool(stock))
         targets = ", ".join(firms) if firms else book["export_who"]
         order = (
             f"{who} Karlı hamle: nakit {book['domestic']} kanalından, marj "
-            f"{market_a} ve {market_b} ihracatından. İç piyasa {book['tr_band']}; "
+            f"{market} ihracatından. İç piyasa {book['tr_band']}; "
             f"ihracat {book['eu_band']}. {targets} hesabına bu hafta bu fiyattan "
             f"teklif atın. Şart: {book['terms']} {book['split']} "
             "İngilizce/Almanca mail taslağı için «mail taslağı» yazın."
@@ -961,13 +1084,14 @@ def advisor_mediate_reply(
         who = f"sağdaki eşleşen kartlardaki {party} eşleştiniz."
     lead = f"{_volume_lead(product, capacity, stock)} {who}"
     _reminder, market_a, market_b, _kind = _advisor_frame(
-        product, capacity, matches, stock=stock
+        product, capacity, matches, stock=stock, session_market=session_market
     )
+    market = _market_phrase(market_a, market_b)
     book = _price_playbook(kind, has_stock=bool(stock))
-    targets = ", ".join(firms) if firms else f"{market_a} ve {market_b} {book['export_who']}"
+    targets = ", ".join(firms) if firms else f"{market} {book['export_who']}"
     order = (
-        f" Karlı hamle: nakit {book['domestic']} kanalından, marj {market_a} ve "
-        f"{market_b} ihracatından. İç piyasa {book['tr_band']}; ihracat "
+        f" Karlı hamle: nakit {book['domestic']} kanalından, marj {market} "
+        f"ihracatından. İç piyasa {book['tr_band']}; ihracat "
         f"{book['eu_band']}. {targets} hesabına bu hafta bu fiyattan teklif atın. "
         f"Şart: {book['terms']} {book['split']} "
         "İngilizce/Almanca mail taslağı için «mail taslağı» yazın."
@@ -986,32 +1110,61 @@ def _single_addressee(name: str) -> str:
     return first or "Purchasing Team"
 
 
-def _draft_bodies(kind: str, en_name: str, de_name: str, cap_en: str) -> tuple[str, str]:
+def _draft_bodies(
+    kind: str, en_name: str, de_name: str, cap_en: str | None
+) -> tuple[str, str]:
     if kind == "print3d":
+        cap_en_bit = f" Capacity note: {cap_en}." if cap_en else ""
+        cap_de_bit = f" Kapazitaet: {cap_en}." if cap_en else ""
         en = (
             f"We provide boutique 3D printing in Turkey for {en_name}. "
             "Materials: PLA and PETG. Typical accuracy is ±0.15–0.20 mm. "
-            "Prototype lead time is 5–7 days; short runs ship in 10–18 days after approval. "
-            f"Capacity note: {cap_en}."
+            "Prototype lead time is 5–7 days; short runs ship in 10–18 days after approval."
+            f"{cap_en_bit}"
         )
         de = (
             f"Wir bieten boutique 3D-Druck in der Tuerkei fuer {de_name}. "
             "Material: PLA und PETG. Genauigkeit ca. ±0,15–0,20 mm. "
-            "Prototyp in 5–7 Tagen; Kleinserie 10–18 Tage nach Freigabe. "
-            f"Kapazitaet: {cap_en}."
+            "Prototyp in 5–7 Tagen; Kleinserie 10–18 Tage nach Freigabe."
+            f"{cap_de_bit}"
         )
         return en, de
-    en = (
-        f"We manufacture {en_name} in Turkey. Capacity: {cap_en}. "
-        "Please find our offer: sample this week, lead time 4-6 weeks, "
-        "repeat orders from the same mill."
-    )
-    de = (
-        f"Wir produzieren {de_name} in der Tuerkei. Kapazitaet: {cap_en}. "
-        "Angebot: Muster diese Woche, Lieferzeit 4-6 Wochen, "
-        "Wiederholauftraege aus derselben Produktion."
-    )
+    if cap_en:
+        en = (
+            f"We manufacture {en_name} in Turkey. Capacity: {cap_en}. "
+            "Please find our offer: sample this week, lead time 4-6 weeks, "
+            "repeat orders from the same mill."
+        )
+        de = (
+            f"Wir produzieren {de_name} in der Tuerkei. Kapazitaet: {cap_en}. "
+            "Angebot: Muster diese Woche, Lieferzeit 4-6 Wochen, "
+            "Wiederholauftraege aus derselben Produktion."
+        )
+    else:
+        en = (
+            f"We manufacture {en_name} in Turkey. "
+            "Please find our offer: sample this week, lead time 4-6 weeks, "
+            "repeat orders from the same mill."
+        )
+        de = (
+            f"Wir produzieren {de_name} in der Tuerkei. "
+            "Angebot: Muster diese Woche, Lieferzeit 4-6 Wochen, "
+            "Wiederholauftraege aus derselben Produktion."
+        )
     return en, de
+
+
+def _capacity_en_for_mail(
+    capacity: str | None, stock: str | None = None
+) -> str | None:
+    """Gerçek capacity/stock yoksa None — ürün adını capacity yapma."""
+    if stock:
+        return f"{_capacity_foreign(stock)} in stock, ship in 7-10 days"
+    if capacity:
+        formatted = format_capacity(capacity)
+        if formatted:
+            return _capacity_foreign(formatted)
+    return None
 
 
 def advisor_draft_reply(
@@ -1019,18 +1172,16 @@ def advisor_draft_reply(
     capacity: str | None = None,
     matches: list[Any] | None = None,
     stock: str | None = None,
+    session_market: str | None = None,
 ) -> str:
     """Tek alıcıya özel kopyala-yapıştır EN/DE teklif. Toplu Dear yok."""
-    reminder, _market_a, _market_b, kind = _advisor_frame(
-        product, capacity, matches, stock=stock
+    _reminder, _market_a, _market_b, kind = _advisor_frame(
+        product, capacity, matches, stock=stock, session_market=session_market
     )
     woven = kind == "woven"
     en_name = _product_en(product, woven)
     de_name = _product_de(product, woven)
-    cap_src = format_capacity(capacity) if capacity else reminder
-    cap_en = _capacity_foreign(cap_src)
-    if stock:
-        cap_en = f"{_capacity_foreign(stock)} in stock, ship in 7-10 days"
+    cap_en = _capacity_en_for_mail(capacity, stock)
     en_body, de_body = _draft_bodies(kind, en_name, de_name, cap_en)
     firms = match_firm_labels(matches, limit=3)
     addressees: list[str] = []
@@ -1045,27 +1196,23 @@ def advisor_draft_reply(
         if len(addressees) >= 3:
             break
     if not addressees:
-        if kind == "print3d":
-            addressees = list(_PRINT3D_FALLBACK_ADDRESSEES[:3])
-        else:
-            addressees = ["Purchasing Team"]
-        firms = firms or list(addressees)
+        addressees = ["Purchasing Team"]
+        firms = ["Purchasing Team"]
     while len(firms) < len(addressees):
         firms.append(addressees[len(firms)])
     blocks: list[str] = []
     for i, firm in enumerate(addressees):
         header = _single_addressee(firms[i] if i < len(firms) else firm)
         to_en = _single_addressee(firm)
-        dear = (
-            f"Dear {to_en},"
-            if kind == "print3d"
-            else f"Dear Purchasing Team at {to_en},"
-        )
-        sehr = (
-            f"Sehr geehrte Damen und Herren bei {to_en},"
-            if kind == "print3d"
-            else f"Sehr geehrte Damen und Herren, {to_en},"
-        )
+        if _fold(to_en) == _fold("Purchasing Team"):
+            dear = "Dear Purchasing Team,"
+            sehr = "Sehr geehrte Damen und Herren,"
+        elif kind == "print3d":
+            dear = f"Dear {to_en},"
+            sehr = f"Sehr geehrte Damen und Herren bei {to_en},"
+        else:
+            dear = f"Dear Purchasing Team at {to_en},"
+            sehr = f"Sehr geehrte Damen und Herren, {to_en},"
         blocks.append(
             f"{header}\n"
             "İngilizce teklif\n"
@@ -1092,14 +1239,19 @@ def advisor_outreach_reply(
     matches: list[Any] | None = None,
     *,
     language_help: bool = False,
+    session_market: str | None = None,
 ) -> str:
     """Kopyala-yapıştır mail + numune taktiği. Soru yok."""
-    reminder, market_a, market_b, kind = _advisor_frame(product, capacity, matches)
+    reminder, market_a, market_b, kind = _advisor_frame(
+        product, capacity, matches, session_market=session_market
+    )
     woven = kind == "woven"
     en_name = _product_en(product, woven)
     de_name = _product_de(product, woven)
-    cap_src = format_capacity(capacity) if capacity else reminder
-    cap_en = _capacity_foreign(cap_src)
+    cap_en = _capacity_en_for_mail(capacity)
+    market = _market_phrase(market_a, market_b)
+    cap_en_clause = f" Capacity: {cap_en}." if cap_en else ""
+    cap_de_clause = f" Kapazitaet: {cap_en}." if cap_en else ""
     if language_help:
         lead = (
             "Yabancı dil şart değil. Aşağıdaki İngilizce ve Almanca metinleri "
@@ -1107,7 +1259,7 @@ def advisor_outreach_reply(
         )
     else:
         lead = (
-            f"{reminder} için {market_a} ve {market_b}'ya bu hafta numune gidecek. "
+            f"{reminder} için {market}'ya bu hafta numune gidecek. "
             "Maili kopyalayıp gönderin."
         )
     return (
@@ -1115,19 +1267,19 @@ def advisor_outreach_reply(
         "İngilizce e-posta\n"
         f"Subject: {en_name} — sample from Turkey\n"
         "Dear Purchasing Team,\n"
-        f"We manufacture {en_name} in Turkey. Capacity: {cap_en}. "
+        f"We manufacture {en_name} in Turkey.{cap_en_clause} "
         "We can send a sample this week. Lead time is 4-6 weeks.\n"
         "Best regards\n\n"
         "Almanca e-posta\n"
         f"Betreff: {de_name} — Muster aus der Tuerkei\n"
         "Sehr geehrte Damen und Herren,\n"
-        f"Wir produzieren {de_name} in der Tuerkei. Kapazitaet: {cap_en}. "
+        f"Wir produzieren {de_name} in der Tuerkei.{cap_de_clause} "
         "Muster senden wir diese Woche. Lieferzeit 4-6 Wochen.\n"
         "Mit freundlichen Gruessen\n\n"
         "Numune taktiği\n"
-        f"- {market_a} ve {market_b}'daki 8-12 firmaya bu hafta gidin.\n"
+        f"- {market}'daki firmalara bu hafta gidin.\n"
         "- Pakette numune, kapasite satırı ve teslim süresi olsun.\n"
-        "- Maili attıktan sonra 5-7 gün bekleyin. Cevap yoksa aynı metni bir kez daha gönderin.\n"
+        "- Cevap yoksa aynı metni bir kez daha gönderin.\n"
         "- Firma adını konu satırına ekleyin. Gövdeyi değiştirmeyin."
     )
 
@@ -1136,10 +1288,15 @@ def advisor_language_reply(
     product: str | None,
     capacity: str | None = None,
     matches: list[Any] | None = None,
+    session_market: str | None = None,
 ) -> str:
     """Dil engeli: şablon + çeviri pratiği. Soru yok."""
     kit = advisor_outreach_reply(
-        product, capacity, matches, language_help=True
+        product,
+        capacity,
+        matches,
+        language_help=True,
+        session_market=session_market,
     )
     return (
         f"{kit}\n\n"
@@ -1159,14 +1316,16 @@ def advisor_report_reply(
     capacity: str | None = None,
     matches: list[Any] | None = None,
     stock: str | None = None,
+    session_market: str | None = None,
 ) -> str:
     """Direktör raporu: fiyat, kanal, rakip, gümrük. Soru yok."""
     reminder, market_a, market_b, kind = _advisor_frame(
-        product, capacity, matches, stock=stock
+        product, capacity, matches, stock=stock, session_market=session_market
     )
+    market = _market_phrase(market_a, market_b)
     book = _price_playbook(kind, has_stock=bool(stock))
     firms = match_firm_labels(matches, limit=3)
-    named = ", ".join(firms) if firms else f"{market_a} ve {market_b} {book['export_who']}"
+    named = ", ".join(firms) if firms else f"{market} {book['export_who']}"
     if kind == "woven":
         steps = (
             f"- Bu hafta {named} hesabına {book['eu_band']} bandından teklif atın.\n"
@@ -1176,7 +1335,7 @@ def advisor_report_reply(
             f"- {book['split']}"
         )
         profiles = (
-            f"- {market_a} ve {market_b}'daki giyim üreticileri. Kendi marka etiketini diktirecek atölyeler.\n"
+            f"- {market}'daki giyim üreticileri. Kendi marka etiketini diktirecek atölyeler.\n"
             f"- {book['domestic']}. Nakit ve hızlı çekim.\n"
             f"- Rakip: {book['rival']}"
         )
@@ -1214,7 +1373,7 @@ def advisor_report_reply(
             f"- {book['split']}"
         )
         profiles = (
-            f"- {market_a} ve {market_b}'daki üreticiler ve marka alıcıları.\n"
+            f"- {market}'daki üreticiler ve marka alıcıları.\n"
             f"- {book['domestic']}.\n"
             f"- Rakip: {book['rival']}"
         )
@@ -1225,7 +1384,7 @@ def advisor_report_reply(
             "- Ambalajı ezilmeye ve neme göre hazırlayın."
         )
     return (
-        f"{reminder} için {market_a} ve {market_b} pazarına giriş notu.\n\n"
+        f"{reminder} için {market} pazarına giriş notu.\n\n"
         f"Pazar giriş adımları\n{steps}\n\n"
         f"Hedef müşteri profilleri\n{profiles}\n\n"
         f"Lojistik ve gümrük ipuçları\n{logistics}"
@@ -1236,8 +1395,12 @@ def advisor_fair_reply(
     product: str | None,
     capacity: str | None = None,
     matches: list[Any] | None = None,
+    session_market: str | None = None,
 ) -> str:
-    reminder, market_a, market_b, kind = _advisor_frame(product, capacity, matches)
+    reminder, market_a, market_b, kind = _advisor_frame(
+        product, capacity, matches, session_market=session_market
+    )
+    market = _market_phrase(market_a, market_b)
     if kind == "woven":
         fairs = (
             "- Almanya: Frankfurt Texprocess. Giyim üreticileri ve etiket alanlar orada olur.\n"
@@ -1253,7 +1416,7 @@ def advisor_fair_reply(
         )
     else:
         fairs = (
-            f"- {market_a} ve {market_b} sektör fuar takvimine bakın.\n"
+            f"- {market} sektör fuar takvimine bakın.\n"
             "- Almanya ve Fransa'daki büyük ticaret fuarlarını ilk sıraya koyun.\n"
             "- Tekstil ise Texworld ve Eurocetex'i de tarayın."
         )
@@ -1271,8 +1434,12 @@ def advisor_linkedin_reply(
     product: str | None,
     capacity: str | None = None,
     matches: list[Any] | None = None,
+    session_market: str | None = None,
 ) -> str:
-    reminder, market_a, market_b, kind = _advisor_frame(product, capacity, matches)
+    reminder, market_a, market_b, kind = _advisor_frame(
+        product, capacity, matches, session_market=session_market
+    )
+    market = _market_phrase(market_a, market_b)
     label = re.sub(r"\s+", " ", (product or "ürününüz").strip()) or "ürününüz"
     sector = (
         "giyim, tekstil"
@@ -1283,40 +1450,141 @@ def advisor_linkedin_reply(
             else "ilgili sektör"
         )
     )
+    cap_line = ""
+    if capacity and format_capacity(capacity):
+        cap_line = f" Kapasite: {format_capacity(capacity)}."
     return (
         f"{reminder} için LinkedIn hedefleme.\n\n"
-        f"- Ülke filtresi: {market_a}, {market_b}.\n"
+        f"- Ülke filtresi: {market}.\n"
         "- Unvan: satın alma, tedarik, üretim. LinkedIn'de purchasing / sourcing diye arayın.\n"
         f"- Sektör: {sector}.\n"
-        f"- Kısa mesaj: {label} üretiyoruz. Kapasite: {reminder}. Numune gönderebilirim.\n"
-        "- İlk turda 8–12 kişiye yazın.\n"
+        f"- Kısa mesaj: {label} üretiyoruz.{cap_line} Numune gönderebilirim.\n"
         "- Aynı kişiye iki günde bir kez daha yazmayın."
     )
+
+
+def _product_buyer_path(
+    kind: str, label: str, market_a: str, market_b: str | None = None
+) -> tuple[str, str, str]:
+    """Ürün → müşteri tipi → pazar. Ödeme/Incoterm yok."""
+    market = _market_phrase(market_a, market_b)
+    if kind == "woven":
+        who = (
+            f"{label} özellikle giyim markaları, konfeksiyon üreticileri ve "
+            "etiket/sourcing satın alma ekipleri için uygundur."
+        )
+        where = (
+            f"{market}'da hazır giyim üreticileri, marka tedarik ekipleri ve "
+            "etiket toptancıları hedef müşteriniz."
+        )
+        channel = (
+            f"- LinkedIn: {market} için purchasing / sourcing unvanına kısa mesaj.\n"
+            "- Fuar: Almanya Texprocess, Paris Texworld, Eurocetex."
+        )
+    elif kind == "print3d":
+        who = (
+            f"{label} butik masaüstü oyun tasarımcıları, mimari maket büroları "
+            "ve kişiselleştirilmiş ürün alıcıları için uygundur."
+        )
+        where = (
+            f"{market}'da Etsy, Amazon Handmade ve yerel "
+            "hediyelik alıcıları hedefleyin."
+        )
+        channel = (
+            f"- LinkedIn: {market} için purchasing / sourcing unvanına kısa mesaj.\n"
+            "- Fuar notu: Spielwarenmesse etkinliktir, alıcı kartı değildir. "
+            "Asıl kanal Etsy, Amazon Handmade ve yerel hediyelik."
+        )
+    elif kind == "steel":
+        who = (
+            f"{label} inşaat yüklenicileri, otomotiv tedarikçileri, "
+            "makine imalatçıları ve çelik tüccarları için uygundur."
+        )
+        where = f"{market}'da bu alıcı tipini hedefleyin."
+        channel = (
+            f"- LinkedIn: {market} için purchasing / sourcing unvanına kısa mesaj.\n"
+            f"- Fuar: {market} sektör fuarları."
+        )
+    else:
+        who = (
+            f"{label} ithalatçı toptancılar ve marka tedarik ekipleri için uygundur."
+        )
+        where = f"{market}'da bu müşteri tipini hedefleyin."
+        channel = (
+            f"- LinkedIn: {market} için purchasing / sourcing unvanına kısa mesaj.\n"
+            f"- Fuar: {market} sektör fuarları."
+        )
+    return who, where, channel
+
+
+def _customer_find_reach_reply(
+    kind: str, label: str, market_a: str, market_b: str | None = None
+) -> str:
+    """T2: ürün → müşteri tipi → nereden bul → nasıl temas."""
+    market = _market_phrase(market_a, market_b)
+    who, where, _channel = _product_buyer_path(kind, label, market_a, market_b)
+    if kind == "woven":
+        find = (
+            f"Nereden bulunur ({market}):\n"
+            f"- LinkedIn: {market} filtresi + purchasing / sourcing / label buyer unvanı.\n"
+            "- Fuar: Texprocess (Almanya), Texworld, Eurocetex — stand ve randevu.\n"
+            "- Firma sitesindeki satın alma / contact maili."
+        )
+        contact = (
+            "Nasıl temas:\n"
+            "- Kısa mesaj: ürün + numune + teslim süresi; aynı metni herkese yapıştırmayın.\n"
+            "- İlk İngilizce/Almanca mesaj için «mail taslağı» yazın.\n"
+            "- İsim listesi için alıcı araması isteyin."
+        )
+    else:
+        find = (
+            f"Nereden bulunur ({market}):\n"
+            f"- LinkedIn: {market} + purchasing / sourcing unvanı.\n"
+            f"- {market} sektör fuarları ve firma siteleri."
+        )
+        contact = (
+            "Nasıl temas:\n"
+            "- Kısa mesaj ve numune teklifi.\n"
+            "- «mail taslağı» yazın; liste için alıcı araması isteyin."
+        )
+    return f"{who} {where}\n\n{find}\n\n{contact}" + _domain_notes(kind)
 
 
 def advisor_reach_reply(
     product: str | None,
     capacity: str | None = None,
     matches: list[Any] | None = None,
+    *,
+    question: str | None = None,
+    session_market: str | None = None,
 ) -> str:
-    reminder, market_a, market_b, kind = _advisor_frame(product, capacity, matches)
-    if kind == "woven":
-        fair_line = "- Fuar: Almanya Texprocess, Paris Texworld, Eurocetex."
-    elif kind == "print3d":
-        fair_line = (
-            "- Fuar notu: Spielwarenmesse etkinliktir, alıcı kartı değildir. "
-            "Asıl kanal Etsy, Amazon Handmade ve yerel hediyelik."
-        )
-    else:
-        fair_line = f"- Fuar: {market_a} ve {market_b} sektör fuarları."
+    reminder, market_a, market_b, kind = _advisor_frame(
+        product, capacity, matches, session_market=session_market
+    )
+    if is_customer_find_ask(question or ""):
+        return _customer_find_reach_reply(kind, reminder, market_a, market_b)
+    who, where, channel = _product_buyer_path(kind, reminder, market_a, market_b)
     return (
-        f"{reminder} için alıcıya nasıl ulaşacağınız.\n\n"
-        f"{fair_line}\n"
-        f"- LinkedIn: {market_a} ve {market_b} için purchasing / sourcing unvanına kısa mesaj.\n"
+        f"{who} {where}\n\n"
+        f"{channel}\n"
         "- Firma sitesinden satın alma maili. Numune, kapasite, teslim süresi yazın.\n"
-        "- İlk turda 8–12 kişi.\n"
         "- Aynı metni herkese yapıştırmayın. Firma adına göre bir cümle değiştirin."
         + _domain_notes(kind)
+    )
+
+
+def _with_language_bridge(text: str) -> str:
+    """Reach omurgasına mevcut dil kiti: çeviri + hazır ilk mesaj."""
+    body = (text or "").rstrip()
+    low = body.casefold()
+    if "translate" in low or "thank you" in low:
+        return body
+    return (
+        f"{body} "
+        "Yabancı dil gerekmez: gelen maili Google Translate'e yapıştırın, "
+        "cevabı kendiniz İngilizce yazmayın. İlk mesajı biz hazırlarız — «mail taslağı» yazın. "
+        "EN: Thank you. Sample is ready. Please share your shipping address. "
+        "DE: Vielen Dank. Das Muster ist bereit. Bitte teilen Sie Ihre Lieferadresse mit."
     )
 
 
@@ -1326,22 +1594,47 @@ def _render_advisor(
     capacity: str | None,
     matches: list[Any] | None,
     stock: str | None = None,
+    *,
+    question: str | None = None,
+    session_market: str | None = None,
 ) -> str:
     if focus == "language":
-        return advisor_language_reply(product, capacity, matches)
+        return advisor_language_reply(
+            product, capacity, matches, session_market=session_market
+        )
     if focus == "draft":
-        return advisor_draft_reply(product, capacity, matches, stock=stock)
+        return advisor_draft_reply(
+            product, capacity, matches, stock=stock, session_market=session_market
+        )
     if focus == "outreach":
-        return advisor_draft_reply(product, capacity, matches, stock=stock)
+        return advisor_outreach_reply(
+            product, capacity, matches, session_market=session_market
+        )
     if focus == "mediate":
-        return advisor_mediate_reply(product, capacity, matches, stock=stock)
+        return advisor_mediate_reply(
+            product, capacity, matches, stock=stock, session_market=session_market
+        )
     if focus == "fair":
-        return advisor_fair_reply(product, capacity, matches)
+        return advisor_fair_reply(
+            product, capacity, matches, session_market=session_market
+        )
     if focus == "linkedin":
-        return advisor_linkedin_reply(product, capacity, matches)
+        return advisor_linkedin_reply(
+            product, capacity, matches, session_market=session_market
+        )
     if focus == "reach":
-        return advisor_reach_reply(product, capacity, matches)
-    return advisor_report_reply(product, capacity, matches, stock=stock)
+        return advisor_reach_reply(
+            product,
+            capacity,
+            matches,
+            question=question,
+            session_market=session_market,
+        )
+    if focus == "docs":
+        return TRADE_DOCS_REPLY
+    return advisor_report_reply(
+        product, capacity, matches, stock=stock, session_market=session_market
+    )
 
 
 def advisor_answer(
@@ -1355,18 +1648,64 @@ def advisor_answer(
     product = session.product if session is not None else None
     capacity = session.capacity if session is not None else None
     stock = session.stock if session is not None else None
-    focus = advisor_focus(question)
+    session_market = session.market if session is not None else None
+    focus = advisor_focus(question, session)
     text = strip_echoed_query(
-        question, _render_advisor(focus, product, capacity, matches, stock)
+        question,
+        _render_advisor(
+            focus,
+            product,
+            capacity,
+            matches,
+            stock,
+            question=question,
+            session_market=session_market,
+        ),
     )
+    if focus == "reach" and is_language_barrier(question):
+        text = _with_language_bridge(text)
+    if focus == "language" and session is not None and session.last_advisor_kind == "reach":
+        text = _with_language_bridge(
+            strip_echoed_query(
+                question,
+                _render_advisor(
+                    "reach",
+                    product,
+                    capacity,
+                    matches,
+                    stock,
+                    question=question,
+                    session_market=session_market,
+                ),
+            )
+        )
+        focus = "reach"
+    if focus == "reach" and "mail taslağı" not in text.casefold():
+        text = (
+            text.rstrip()
+            + " İngilizce veya Almanca ilk mesaj için «mail taslağı» yazın; "
+            "müşteri listesi için alıcı araması isteyin."
+        )
+    if is_mixed_commercial_start(question):
+        if is_trade_docs_ask(question) and "ticari fatura" not in text.casefold():
+            text = text.rstrip() + " " + TRADE_DOCS_SUPPORT
     prev = (session.last_advisor_text or "").strip() if session is not None else ""
-    sticky = {"mediate", "draft", "language"}
+    sticky = {"mediate", "draft", "language", "reach", "outreach"}
     if prev and text.strip() == prev and focus not in sticky:
         for alt in ("reach", "fair", "linkedin", "draft", "mediate", "language", "report"):
             if alt == focus:
                 continue
             cand = strip_echoed_query(
-                question, _render_advisor(alt, product, capacity, matches, stock)
+                question,
+                _render_advisor(
+                    alt,
+                    product,
+                    capacity,
+                    matches,
+                    stock,
+                    question=question,
+                    session_market=session_market,
+                ),
             )
             if cand.strip() != prev:
                 text = cand
@@ -1399,16 +1738,16 @@ class ChatTurn:
         return {"role": self.role, "content": self.content}
 
 
-@dataclass
 class SessionAccessDenied(Exception):
     """Cross-account session access — map to HTTP 404 at the API edge."""
 
 
+@dataclass
 class SessionState:
+    session_id: str
     # Pilot Security Phase 1: ownership metadata (commercial slots unchanged).
     account_id: str | None = None
     created_by_user_id: str | None = None
-    session_id: str
     name: str | None = None
     product: str | None = None
     capacity: str | None = None
@@ -1501,6 +1840,28 @@ def _normalize_history(raw: list[Any] | None) -> list[ChatTurn]:
     return turns[-MAX_TURNS:]
 
 
+def _kind_from_advisor_text(folded: str) -> str:
+    """Playbook parmak izi. CTA («mail taslağı») stage değildir."""
+    body = folded or ""
+    if "ceviri pratigi" in body:
+        return "language"
+    if "kopyala-yapistir hazir" in body or "offer and sample from turkey" in body:
+        return "draft"
+    if "numune taktik" in body or (
+        "sample from turkey" in body and "offer and sample" not in body
+    ):
+        return "outreach"
+    if "pazar giris adim" in body:
+        return "report"
+    if "eslestiniz" in body or "karli hamle" in body:
+        return "mediate"
+    if "linkedin hedefleme" in body:
+        return "linkedin"
+    if "icin fuar yolu" in body:
+        return "fair"
+    return "reach"
+
+
 def infer_slots(state: SessionState) -> None:
     """Asistan sorularından last_ask / dolu slotları geri kur."""
     msgs = state.messages
@@ -1521,7 +1882,9 @@ def infer_slots(state: SessionState) -> None:
         if "hangi urun" in low:
             if nxt:
                 product, cap, stock = split_product_and_volume(nxt)
-                state.product = product or nxt
+                slotted = extract_product_slot(product) or extract_product_slot(nxt)
+                if slotted:
+                    state.product = slotted
                 if cap:
                     state.capacity = cap
                 if stock:
@@ -1531,10 +1894,14 @@ def infer_slots(state: SessionState) -> None:
                 state.last_ask = "product"
         if "hangisiyle" in low or "baglayalim" in low:
             if nxt and looks_like_stock(nxt):
-                state.stock = extract_stock(nxt) or nxt
+                extracted_stock = extract_stock(nxt)
+                if extracted_stock:
+                    state.stock = extracted_stock
                 state.last_ask = None
             elif nxt and looks_like_capacity(nxt):
-                state.capacity = extract_capacity(nxt) or nxt
+                extracted_cap = extract_capacity(nxt)
+                if extracted_cap:
+                    state.capacity = extracted_cap
                 state.last_ask = None
             elif nxt and classify_option_pick(nxt):
                 state.last_ask = None
@@ -1543,9 +1910,13 @@ def infer_slots(state: SessionState) -> None:
         if "kapasite" in low and "ciddi bir guc" not in low:
             if nxt:
                 if looks_like_stock(nxt):
-                    state.stock = extract_stock(nxt) or nxt
+                    extracted_stock = extract_stock(nxt)
+                    if extracted_stock:
+                        state.stock = extracted_stock
                 else:
-                    state.capacity = extract_capacity(nxt) or nxt
+                    extracted_cap = extract_capacity(nxt)
+                    if extracted_cap:
+                        state.capacity = extracted_cap
                 state.last_ask = None
             elif "hangisiyle" not in low:
                 state.last_ask = None
@@ -1579,18 +1950,7 @@ def infer_slots(state: SessionState) -> None:
             state.last_advisor_kind = None
             break
         state.last_advisor_text = body
-        if "eslestiniz" in folded or "mail taslagi" in folded:
-            state.last_advisor_kind = "mediate"
-        elif "subject:" in folded or "dear purchasing" in folded:
-            state.last_advisor_kind = "draft"
-        elif "pazar giris adim" in folded:
-            state.last_advisor_kind = "report"
-        elif "linkedin" in folded:
-            state.last_advisor_kind = "linkedin"
-        elif "fuar" in folded:
-            state.last_advisor_kind = "fair"
-        else:
-            state.last_advisor_kind = "reach"
+        state.last_advisor_kind = _kind_from_advisor_text(folded)
         break
 
 
@@ -1780,17 +2140,23 @@ def hydrate(
         return state
 
 
-def session_notes(session: SessionState | None) -> str:
+def session_notes(session: SessionState | None, question: str | None = None) -> str:
     if session is None:
         return ""
+    hide_stale_product = bool(
+        question
+        and session.product
+        and stale_session_product_conflict(session.product, question)
+    )
     bits: list[str] = []
     if session.name:
         bits.append(f"Hitap: {session.name}")
-    if session.product:
+    if session.product and not hide_stale_product:
         bits.append(f"Ürün: {session.product}")
     if session.capacity:
         canonical = format_capacity(session.capacity)
-        reminder = capacity_reminder(session.product, canonical)
+        reminder_product = None if hide_stale_product else session.product
+        reminder = capacity_reminder(reminder_product, canonical)
         bits.append(
             "Kapasite (tam ölçek, basamak kırpma yasak): "
             f"{canonical}. Hatırlatma kalıbı: {reminder}"
@@ -1859,9 +2225,11 @@ def continue_intake(session: SessionState, user_text: str) -> str:
         if stock:
             session.stock = stock
         if capacity:
-            session.capacity = capacity or format_capacity(text)
+            session.capacity = capacity
         elif looks_like_capacity(text) and not looks_like_stock(text):
-            session.capacity = format_capacity(text)
+            parsed_cap = format_capacity(text)
+            if parsed_cap:
+                session.capacity = parsed_cap
         session.last_ask = None
         return strip_echoed_query(
             text,

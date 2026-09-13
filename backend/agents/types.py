@@ -62,5 +62,6 @@ class AgentDeps:
     match_threshold: float
     session: Any = None
     account_slug: str = "demo"
+    account_id: str = ""
     goal: str = ""
     file_names: list[str] = field(default_factory=list)

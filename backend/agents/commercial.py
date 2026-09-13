@@ -8,11 +8,23 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from prompts import (
+    TRADE_DOCS_REPLY,
+    advisor_focus,
+    is_buyer_firm_hunt,
+    is_commercial_start,
     is_competitor_research,
+    is_customer_find_ask,
     is_decision_question,
     is_diagnostic_request,
+    is_draft_request,
+    is_incoterm_ask,
+    is_mixed_commercial_start,
+    is_payment_ask,
     is_planning_ask,
+    is_pricing_ask,
+    is_sample_ask,
     is_stat_challenge,
+    is_trade_docs_ask,
 )
 
 Mode = Literal["decision", "diagnostic", "buyer_priority", "matching", "general"]
@@ -83,7 +95,7 @@ _SUPPLIER_PICK = re.compile(
     r"(?i)((tedarik[cç]i|distrib[uü]t[oö]r).{0,40}(se[cç]|hangi)|"
     r"iki\s+(tedarik[cç]i|distrib[uü]t[oö]r))"
 )
-_INCOTERMS = re.compile(r"(?i)\b(fob|cif)\b")
+_INCOTERMS = re.compile(r"(?i)\b(fob|cif|exw|fca|dap|ddp|cpt|cip|incoterms?)\b")
 _CREDIT_ACCEPT = re.compile(
     r"(?i)("
     r"kabul\s*m[uü]|reddedeyim|sipari[sş]i kabul|"
@@ -132,6 +144,11 @@ class CommercialBrief:
     tradeoff: str = ""
     change_mind: str = ""
     provenance_note: str = ""
+    # V5.18.5 Phase 3: journey context for LLM (derived; not invented facts)
+    situation: CommercialSituation | None = None
+    policy: CommercialPolicy | None = None
+    # V5.18.5 Phase 4: persona / judgment (LLM path only; not session facts)
+    judgment: CommercialJudgmentKit | None = None
 
     def as_prompt(self) -> str:
         lines = [
@@ -149,7 +166,7 @@ class CommercialBrief:
             lines.append("KULLANICI BİLGİSİ (fact değil):")
             lines.extend(f"- {c}" for c in self.user_claims)
         if self.priorities:
-            lines.append("Alıcı önceliği (eşleşme skoru ≠ ticari uygunluk):")
+            lines.append("Sıra (eşleşme skoru ≠ ticari uygunluk; başlığı basma):")
             for item in self.priorities[:8]:
                 score = (
                     f" eşleşme={item.match_score:.2f}"
@@ -170,10 +187,13 @@ class CommercialBrief:
         if self.critical_questions:
             lines.append("Duruştan SONRA gerekirse en fazla 1–3 soru (soru duruşun yerine geçmez):")
             lines.extend(f"- {q}" for q in self.critical_questions[:3])
+        lines.extend(self._situation_prompt_lines())
+        lines.extend(self._judgment_prompt_lines())
         if self.provenance_note:
             lines.append("PROVENANCE: " + self.provenance_note)
         lines.append(
             "Bu iç yapıyı başlık başlık dökme. Doğal konuş. "
+            "«Sonraki adım:», «Kararı değiştiren veri:» ve iç yönerge basma. "
             "Kullanıcı iddiasını OBJECTIVE FACT yapma. "
             "Eşleşme skorunu kazanma ihtimali gibi sunma. "
             "«İkisi de olabilir» ile yetinme. Uydurma rakam yok. "
@@ -181,6 +201,61 @@ class CommercialBrief:
             "Aynı «Ben şu aşamada X'i bırakmazdım» kalıbını ezberleme."
         )
         return "\n".join(lines)
+
+    def _situation_prompt_lines(self) -> list[str]:
+        """Journey guidance for LLM — never invent commercial facts."""
+        sit = self.situation
+        if sit is None:
+            return []
+        policy = self.policy
+        lines = [
+            "TİCARİ YOLCULUK (iç rehber; kullanıcıya enum/etiket basma):",
+            f"- Aşama: {sit.sales_stage}",
+        ]
+        missing = list(sit.missing_critical or [])
+        lines.append(
+            "- Eksik kritik: "
+            + (", ".join(missing) if missing else "yok")
+            + " (bilinmiyor ≠ uydur)"
+        )
+        lines.append(f"- Sonraki adım kodu: {sit.next_best_action}")
+        if policy and policy.nba_line:
+            lines.append("- Sonraki adım rehberi (doğal): " + policy.nba_line)
+        risks = list(sit.risk_flags or [])
+        lines.append("- Risk bayrakları: " + (", ".join(risks) if risks else "yok"))
+        if policy and policy.allowed_topics:
+            lines.append(
+                "- Bu turda uygun konular: " + ", ".join(policy.allowed_topics)
+            )
+        lines.append(
+            "- Sorulmadıkça açma: ödeme şartı, Incoterm, gümrük, navlun/freight, "
+            "checklist dump."
+        )
+        if policy and policy.ask_missing and policy.missing_question:
+            lines.append(
+                "- Gerekirse tek kritik soru (zorunlu değil): "
+                + policy.missing_question
+            )
+        else:
+            lines.append("- Bu turda soru sormak zorunlu değil.")
+        lines.append(
+            "- Öncelik: (1) mevcut kullanıcı sorusu (2) güvenilir oturum fact'leri "
+            "(3) retrieval (4) bu yolculuk rehberi. Yolculuk soruyu ezmesin."
+        )
+        lines.append(
+            "- Uydurma yasak: firma, alıcı, kişi, e-posta, fiyat, kapasite, MOQ, "
+            "lead time, ödeme, Incoterm, gümrük, sertifika, regülasyon, pazar payı."
+        )
+        lines.append(
+            "- «Şu şirket kesin müşteriniz olur» deme; «bu müşteri tipi daha uygun "
+            "olabilir» de."
+        )
+        return lines
+
+    def _judgment_prompt_lines(self) -> list[str]:
+        if self.judgment is None:
+            return []
+        return self.judgment.as_prompt_lines()
 
 
 def extract_user_claims(question: str) -> list[str]:
@@ -273,7 +348,7 @@ def prioritize_matches(matches: list[Any] | None) -> list[BuyerPriority]:
         }
         if match_fit == "high" and (country or product or has_contact):
             band = "A"
-            reason = "Ürün eşleşmesi yüksek ve pazar/ürün sinyali var."
+            reason = "Ürün ve pazar uyumu güçlü; hemen temas."
             if not has_contact:
                 reason += " Temas bilgisi doğrulanmalı; eksik iletişim olumsuz müşteri hükmü değildir."
             else:
@@ -319,6 +394,8 @@ def cluster_matches(matches: list[Any] | None) -> str:
 
 def classify_commercial_mode(question: str) -> Mode:
     text = question or ""
+    if is_trade_docs_ask(text):
+        return "general"
     if _HIGH_VOL_LOW_MARGIN.search(text) or _LOW_VOL_HIGH_MARGIN.search(text):
         return "decision"
     if _BEST_BUYER.search(text) or (
@@ -377,6 +454,10 @@ def is_false_confidence(text: str) -> bool:
 
 def human_intent_detail(intent: str, question: str) -> str:
     """UI niyet satırı: skor, ajan adı, LLM yok."""
+    if is_trade_docs_ask(question):
+        return (
+            "Önce ihracat evrakını sayacağım; teslim şartını belgelerden sonra konuşacağım."
+        )
     mode = classify_commercial_mode(question)
     if mode == "decision":
         return "Bunu bir ticari karar sorusu olarak okuyorum. Skor tablosu yok; duruş ve sonraki adım vereceğim."
@@ -495,6 +576,11 @@ def _stance_and_action(
         or _CAPACITY_TIGHT.search(str(capacity or ""))
         or _CAPACITY_TIGHT.search(_company_line(session))
     )
+    if is_trade_docs_ask(text):
+        return (
+            "Sevkiyat dosyasına ticari fatura, menşe, EUR.1, fitosaniter ve analiz raporunu koyun.",
+            "Teklifte teslimi EXW veya FCA yazın; ödemeyi evrakla birlikte netleştirin.",
+        )
     if _HIGH_VOL_LOW_MARGIN.search(text):
         return (
             "Hacmi tek başına öncelik yapma. Düşük marjlı yüksek hacim operasyonu ve nakit bağlar.",
@@ -554,6 +640,12 @@ def _stance_and_action(
             "Kapsama, MOQ ve teslimatı yan yana koy; kör seçim yok.",
         )
     if _INCOTERMS.search(text):
+        if re.search(r"(?i)\b(exw|fca|dap)\b", text) and not re.search(r"(?i)\b(fob|cif)\b", text):
+            return (
+                "EXW Ex Works (işyerinde teslim), FCA Free Carrier (taşıyıcıya teslim); "
+                "ikisi de ihracat belgesi değil teslim şartıdır.",
+                "Navlun net değilse EXW veya FCA tut; DAP'ı lojistik netleşince konuş.",
+            )
         return (
             "Lojistik maliyet doğrulanmadan CIF'e geçmeyi önermem; şimdilik FOB şartını seç.",
             "Navlun ve sigorta netleşince CIF'i ikinci test olarak konuş.",
@@ -657,6 +749,8 @@ def build_commercial_brief(
     matches: list[Any] | None = None,
     tools: list[Any] | None = None,
     pack: Any = None,
+    situation: CommercialSituation | None = None,
+    focus: str | None = None,
 ) -> CommercialBrief:
     mode = classify_commercial_mode(question)
     claims = extract_user_claims(question)
@@ -679,6 +773,35 @@ def build_commercial_brief(
     available, tradeoff, change, prov = _decision_frame(
         question, session, leads, stance, pack
     )
+    # V5.18.5 Phase 3: attach journey once (reuse caller situation when provided).
+    kind = (focus or "").strip() or None
+    sit = situation or build_commercial_situation(
+        question, session=session, focus=kind
+    )
+    policy = build_commercial_policy(
+        sit, question=question, session=session, focus=kind
+    )
+    # Soft-enrich CMO next_action with natural NBA when empty / generic.
+    if policy.nba_line and (
+        not (action or "").strip()
+        or action == "Somut bir sonraki ticari adım söyle."
+    ):
+        action = policy.nba_line
+    # Cap journey question into critical_questions only when policy allows and empty.
+    if (
+        policy.ask_missing
+        and policy.missing_question
+        and not questions
+        and sit.sales_stage
+        in (
+            "DISCOVERY",
+            "PRODUCT",
+            "MARKET",
+            "CUSTOMER_IDENTIFICATION",
+            "LEAD_QUALIFICATION",
+        )
+    ):
+        questions = [policy.missing_question]
     return CommercialBrief(
         mode=mode,
         human_plan=human,
@@ -695,6 +818,11 @@ def build_commercial_brief(
         tradeoff=tradeoff,
         change_mind=change,
         provenance_note=prov,
+        situation=sit,
+        policy=policy,
+        judgment=build_commercial_judgment_kit(
+            sit, policy=policy, question=question, session=session
+        ),
     )
 
 
@@ -747,6 +875,16 @@ def _decision_frame(
 def _human_plan(mode: Mode, question: str, session: Any, stance: str) -> str:
     product = getattr(session, "product", None) if session is not None else None
     market = getattr(session, "market", None) if session is not None else None
+    if is_mixed_commercial_start(question or ""):
+        return (
+            "Önce hedef pazarda müşteri tipi ve ulaşma yolunu netleştirip kısa bir "
+            "yol haritası vereceğim; evrakı destek olarak ekleyeceğim."
+        )
+    if is_trade_docs_ask(question or ""):
+        return (
+            "Önce ihracat evrakını (fatura, menşe, EUR.1, fitosaniter, analiz) sayacağım, "
+            "Incoterms teslim şartını belgelerden sonra ekleyeceğim."
+        )
     if mode == "decision" and is_market_switch(question or ""):
         return (
             "Önce eldeki pazardaki fırsatları fiyat baskısı açısından değerlendireceğim, "
@@ -764,19 +902,23 @@ def _human_plan(mode: Mode, question: str, session: Any, stance: str) -> str:
         )
     if mode == "matching":
         return "Eşleşme skorunu ticari uygunluktan ayırıp ürün-pazar uyumunu yorumlayacağım."
+    # Stance stays in commercial brief / LLM system only — never Agent Flow plan.
+    _ = stance
     bits = ["Durumu ticari olarak okuyup net bir öneri ve sonraki adım vereceğim."]
     if product:
         bits.append(f"Ürün: {product}.")
     if market:
         bits.append(f"Pazar: {market}.")
-    if stance:
-        bits.append(stance)
     return " ".join(bits)
 
 
 def commercial_fallback_reply(brief: CommercialBrief, question: str) -> str | None:
     """LLM yok/reddedilince kural tabanlı CMO cevabı. Ezber cümle değil, aynı mantık."""
     text = question or ""
+    if is_mixed_commercial_start(text) or advisor_focus(text) == "reach":
+        return None
+    if is_trade_docs_ask(text):
+        return TRADE_DOCS_REPLY
     if brief.mode == "decision" and is_market_switch(text) and _PRICE_PRESSURE.search(text):
         n = ""
         hit = _LEAD_COUNT.search(text)
@@ -792,52 +934,56 @@ def commercial_fallback_reply(brief: CommercialBrief, question: str) -> str | No
             "Önce bu müşterilerde fiyatın gerçekten kabul edilemez bir marja inip inmediğini ölçmek daha doğru. "
             "Üçünde de aynı tablo çıkarsa Fransa'yı ikinci test pazarı olarak açabiliriz. "
             f"{q1} "
-            + (f"Kararı değiştiren veri: {brief.change_mind} " if brief.change_mind else "")
+            + (
+                (brief.change_mind.rstrip(".!?") + ". ")
+                if brief.change_mind
+                else ""
+            )
             + "İstersen şimdi bu müşterileri fiyat, ürün uyumu ve potansiyel sipariş açısından önceliklendirelim."
         )
     if brief.mode == "decision" and _HIGH_VOL_LOW_MARGIN.search(text):
         return (
             "Ben bu hacmi bugün kovalamazdım. Yüksek sipariş düşük marjla nakit ve kapasiteyi bağlar. "
-            "Kararı değiştiren veri: birim marjın kabul eşiğinin üstünde kalması. "
+            "Birim marj kabul eşiğinin üstünde kalırsa bu kararı değiştiririm. "
             "Önce marj kırılımını masaya koyalım."
         )
     if brief.mode == "decision" and _LOW_VOL_HIGH_MARGIN.search(text):
         return (
             "Ben olsam bu yüksek marjlı, az hacimli hesapları önce test ederdim. "
             "Ölçek vermez ama marjı ve kapasiteyi korur. "
-            "Sonraki adım: ikisini tekrar sipariş ve ödeme disiplinine göre sırala."
+            "İkisini tekrar sipariş ve ödeme disiplinine göre sıralayın."
         )
     if brief.mode == "decision" and _FRANCE_EMPTY.search(text):
         return (
             "Pazar büyük iddiası henüz kaynaklı veri değil. Fransa'da lead yokken oraya yönelmek giriş maliyeti taşır. "
             "Ben olsam önce eldeki sinyali bırakmaz, Fransa büyüklüğünü kaynakla doğrulatırdım. "
-            "Kararı değiştiren veri: doğrulanmış talep ve en az birkaç nitelikli lead."
+            "Doğrulanmış talep ve en az birkaç nitelikli lead bu kararı değiştirir."
         )
     if brief.mode == "decision" and _COMPETITOR_CHEAP.search(text):
         return (
             "Rakibin yüzde yirmi düşük sattığı senin aktardığın tablo; ben bunu henüz fact yapmam. "
             "Fiyatı eşitlemek marjı yakabilir. Önce kendi brüt marjın ve rakibin gerçek teklifi. "
-            "Kararı değiştiren veri: doğrulanmış rakip fiyatı ve senin eşiğinin üstünde kalan marj."
+            "Doğrulanmış rakip fiyatı ve eşiğinin üstünde kalan marj bu kararı değiştirir."
         )
     if is_competitor_research(text) and not is_stat_challenge(text):
         return (
             "Rakip hareketini senin aktardığın kadarıyla görüyorum; güncel rakip fiyat veya pazar payı uydurmam. "
-            "Fiyatı hemen eşitlemem. Kararı değiştiren veri: doğrulanmış rakip teklifi ve senin marj eşiğin. "
+            "Fiyatı hemen eşitlemem. Doğrulanmış rakip teklifi ve marj eşiğin bu kararı değiştirir. "
             "Önce kendi teklifini marj kırılımıyla masaya koy."
         )
     if brief.mode == "decision" and _PRICE_CUT.search(text):
         return (
             "Ben fiyatı şu anda düşürmezdim. Önce mevcut brüt marjın hâlâ nefes alıp almadığına bakardım. "
             "Marj zaten inciyse indirim ciroyu değil zararı büyütür. "
-            "Kararı değiştirecek veri: bugünkü marj ve rakibin gerçekten ödediği fiyat. "
-            "Sonraki adım: mevcut teklifi marj kırılımıyla masaya koy, sonra indirimi konuş."
+            "Bugünkü marj ve rakibin gerçekten ödediği fiyat bu kararı değiştirir. "
+            "Mevcut teklifi marj kırılımıyla masaya koyun, sonra indirimi konuşun."
         )
     if brief.mode == "diagnostic":
         if re.search(r"(?i)yeni\s*m[uü][sş]teri\s*(gelmiyor|yok|durdu)", text):
             return (
                 "Mevcut müşteri sipariş veriyorsa asıl delik kazanım tarafı. "
                 "Reklam bütçesini artırmadan önce yeni girişin neden durduğunu ayıralım. "
-                "Elimde CRM yok; funnel uydurmam. Sonraki adım: kanal ve teklif tıkanıklığını netleştir."
+                "Elimde CRM yok; funnel uydurmam. Kanal ve teklif tıkanıklığını netleştirin."
             )
         if re.search(r"(?i)mevcut\s*m[uü][sş]teri.{0,16}ayn[ıi]", text):
             return (
@@ -889,6 +1035,23 @@ def is_weak_decision(text: str) -> bool:
     return bool(_WEAK_BOTH.search(text or "") or _HESITATION.search(text or ""))
 
 
+_EXPORT_DOC_HIT = re.compile(
+    r"(?i)("
+    r"certificate of origin|men[sş]e|"
+    r"commercial invoice|ticari fatura|"
+    r"eur\.?\s*1|"
+    r"phytosanitary|fitosaniter|"
+    r"analysis report|analiz raporu"
+    r")"
+)
+
+
+def lists_export_documents(text: str) -> bool:
+    """Cevap gerçek ihracat evrakını sayıyor mu (Incoterms saymak yetmez)."""
+    found = {m.group(0).casefold() for m in _EXPORT_DOC_HIT.finditer(text or "")}
+    return len(found) >= 2
+
+
 def is_reasoning_task(question: str) -> bool:
     """Karar / teşhis / öncelik / rakip: reasoning model. Selamlama değil."""
     mode = classify_commercial_mode(question)
@@ -918,3 +1081,708 @@ def treats_score_as_win(text: str) -> bool:
     ):
         return False
     return True
+
+
+# --- V5.18.5 Phase 1: Commercial Intelligence Core (derived only, no LLM) ---
+
+SalesStage = Literal[
+    "DISCOVERY",
+    "PRODUCT",
+    "MARKET",
+    "CUSTOMER_IDENTIFICATION",
+    "LEAD_QUALIFICATION",
+    "OUTREACH",
+    "SAMPLE",
+    "QUOTATION",
+    "NEGOTIATION",
+    "PAYMENT",
+    "LOGISTICS",
+    "DELIVERY",
+    "REPEAT_ORDER",
+]
+
+NextBestAction = Literal[
+    "clarify_product",
+    "clarify_market",
+    "identify_customer",
+    "qualify_buyer",
+    "prepare_outreach",
+    "send_sample",
+    "follow_up",
+    "prepare_quotation",
+    "negotiate",
+    "clarify_payment",
+    "clarify_logistics",
+    "clarify_incoterm",
+    "none",
+]
+
+MissingCritical = Literal["product", "market", "buyer_type", "capacity"]
+
+RiskFlag = Literal[
+    "capacity_unset",
+    "market_unset",
+    "product_unset",
+]
+
+_QUALIFY_ASK = re.compile(
+    r"(?i)("
+    r"uygun\s+(m[uü][sş]teri|al[iı]c[iı]|firma)|"
+    r"(m[uü][sş]teri|al[iı]c[iı]|lead).{0,24}(nitelendir|qualify|eleme)|"
+    r"(nitelendir|qualify|ele).{0,24}(m[uü][sş]teri|al[iı]c[iı]|lead)|"
+    r"ciddi\s+(al[iı]c[iı]|m[uü][sş]teri)\s+mu|"
+    r"lead\s+qualification"
+    r")"
+)
+_QUOTATION_ASK = re.compile(
+    r"(?i)("
+    r"teklif\s*(haz[iı]rla|yaz|ver|oluştur|olustur)|"
+    r"quotation|"
+    r"fiyat\s*teklif|"
+    r"proforma|"
+    r"\bmoq\b|"
+    r"birim\s*fiyat"
+    r")"
+)
+_NEGOTIATION_ASK = re.compile(
+    r"(?i)("
+    r"pazarl[iı]k|"
+    r"negotiat|"
+    r"indirim\s*(iste|yap|konu)|"
+    r"kar[sş][iı]\s*teklif|"
+    r"fiyat[iı]\s*d[uü][sş][uü]r"
+    r")"
+)
+_DELIVERY_ASK = re.compile(
+    r"(?i)("
+    r"teslimat\s*(s[uü]resi|tarih|nas[iı]l)|"
+    r"ne\s*zaman\s*teslim|"
+    r"delivery\s*(time|date|schedule)|"
+    r"lead\s*time"
+    r")"
+)
+_LOGISTICS_ASK = re.compile(
+    r"(?i)("
+    r"lojistik|"
+    r"navlun|"
+    r"freight|"
+    r"kargo\s*(se[cç]|nas[iı]l)|"
+    r"g[uü]mr[uü]k|"
+    r"customs"
+    r")"
+)
+@dataclass(frozen=True)
+class CommercialSituation:
+    """Derived commercial context — not session facts.
+
+    Never copies product/market/capacity into invented facts.
+    """
+
+    sales_stage: SalesStage
+    missing_critical: list[str] = field(default_factory=list)
+    next_best_action: NextBestAction = "none"
+    risk_flags: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sales_stage": self.sales_stage,
+            "missing_critical": list(self.missing_critical),
+            "next_best_action": self.next_best_action,
+            "risk_flags": list(self.risk_flags),
+        }
+
+
+def _session_slot(session: Any, name: str) -> str | None:
+    if session is None:
+        return None
+    value = getattr(session, name, None)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def derive_sales_stage(
+    question: str,
+    *,
+    session: Any = None,
+    focus: str | None = None,
+) -> SalesStage:
+    """Question evidence first; session slots only as soft context."""
+    text = question or ""
+    product = _session_slot(session, "product")
+    market = _session_slot(session, "market")
+    kind = (focus or "").strip() or None
+    if kind is None:
+        kind = advisor_focus(text, session)
+
+    if is_sample_ask(text):
+        return "SAMPLE"
+    if is_draft_request(text) or kind == "draft":
+        return "OUTREACH"
+    if is_payment_ask(text):
+        return "PAYMENT"
+    if is_incoterm_ask(text):
+        return "LOGISTICS"
+    if _LOGISTICS_ASK.search(text) or (
+        is_trade_docs_ask(text) and not is_mixed_commercial_start(text)
+    ):
+        return "LOGISTICS"
+    if _NEGOTIATION_ASK.search(text):
+        return "NEGOTIATION"
+    if is_pricing_ask(text) or _QUOTATION_ASK.search(text):
+        return "QUOTATION"
+    if _REPEAT_ORDERS.search(text):
+        return "REPEAT_ORDER"
+    if _DELIVERY_ASK.search(text):
+        return "DELIVERY"
+    if is_customer_find_ask(text) or is_buyer_firm_hunt(text):
+        return "CUSTOMER_IDENTIFICATION"
+    if _QUALIFY_ASK.search(text):
+        return "LEAD_QUALIFICATION"
+
+    start = (
+        is_commercial_start(text)
+        or is_mixed_commercial_start(text)
+        or kind == "reach"
+    )
+    if start:
+        if product and market:
+            return "MARKET"
+        if product:
+            return "PRODUCT"
+        if market:
+            return "MARKET"
+        return "DISCOVERY"
+
+    if product and not market:
+        return "PRODUCT"
+    if product and market:
+        return "MARKET"
+    if market and not product:
+        return "PRODUCT"
+    return "DISCOVERY"
+
+
+def derive_missing_critical(
+    sales_stage: SalesStage,
+    *,
+    session: Any = None,
+    question: str = "",
+) -> list[str]:
+    """At most one stage-relevant gap. Never invents slot values."""
+    product = _session_slot(session, "product")
+    market = _session_slot(session, "market")
+    capacity = _session_slot(session, "capacity")
+    buyer_known = _buyer_type_evident(question, session)
+
+    if not product:
+        return ["product"]
+
+    if sales_stage in ("DISCOVERY", "PRODUCT") and not market:
+        return ["market"]
+
+    if sales_stage == "MARKET":
+        if not market:
+            return ["market"]
+        if not buyer_known:
+            return ["buyer_type"]
+        return []
+
+    if sales_stage in ("CUSTOMER_IDENTIFICATION", "LEAD_QUALIFICATION"):
+        if not buyer_known:
+            return ["buyer_type"]
+        return []
+
+    if sales_stage in ("OUTREACH", "SAMPLE", "QUOTATION") and not capacity:
+        return ["capacity"]
+
+    return []
+
+
+def derive_next_best_action(
+    sales_stage: SalesStage,
+    *,
+    missing_critical: list[str] | None = None,
+    session: Any = None,
+    question: str = "",
+) -> NextBestAction:
+    """Evidence-led next step — question + stage + missing, not a rigid FSM."""
+    missing = list(missing_critical or [])
+    text = question or ""
+    market = _session_slot(session, "market")
+    buyer_known = _buyer_type_evident(text, session)
+
+    if "product" in missing:
+        return "clarify_product"
+    if "market" in missing and sales_stage in ("DISCOVERY", "PRODUCT", "MARKET"):
+        return "clarify_market"
+
+    if sales_stage == "DISCOVERY":
+        return "clarify_product"
+    if sales_stage == "PRODUCT":
+        return "clarify_market" if not market else "identify_customer"
+    if sales_stage == "MARKET":
+        if buyer_known:
+            return "identify_customer"
+        return "identify_customer"
+    if sales_stage == "CUSTOMER_IDENTIFICATION":
+        # User already asks who/where → next is outreach; else qualify first.
+        if is_customer_find_ask(text) or buyer_known:
+            return "prepare_outreach"
+        return "qualify_buyer"
+    if sales_stage == "LEAD_QUALIFICATION":
+        return "prepare_outreach"
+    if sales_stage == "OUTREACH":
+        return "send_sample"
+    if sales_stage == "SAMPLE":
+        return "prepare_quotation"
+    if sales_stage == "QUOTATION":
+        return "negotiate"
+    if sales_stage == "NEGOTIATION":
+        return "clarify_payment"
+    if sales_stage == "PAYMENT":
+        return "clarify_logistics"
+    if sales_stage == "LOGISTICS":
+        return "clarify_incoterm"
+    if sales_stage == "DELIVERY":
+        return "follow_up"
+    if sales_stage == "REPEAT_ORDER":
+        return "follow_up"
+    return "none"
+
+
+def derive_risk_flags(*, session: Any = None) -> list[str]:
+    """Observational flags only — do not fill capacity/market/product."""
+    flags: list[str] = []
+    if not _session_slot(session, "product"):
+        flags.append("product_unset")
+    if not _session_slot(session, "market"):
+        flags.append("market_unset")
+    if _session_slot(session, "product") and not _session_slot(session, "capacity"):
+        flags.append("capacity_unset")
+    return flags
+
+
+def build_commercial_situation(
+    question: str,
+    *,
+    session: Any = None,
+    focus: str | None = None,
+) -> CommercialSituation:
+    """Deterministic Commercial Intelligence Core. No LLM, no retrieval."""
+    stage = derive_sales_stage(question, session=session, focus=focus)
+    missing = derive_missing_critical(stage, session=session, question=question)
+    nba = derive_next_best_action(
+        stage,
+        missing_critical=missing,
+        session=session,
+        question=question,
+    )
+    flags = derive_risk_flags(session=session)
+    return CommercialSituation(
+        sales_stage=stage,
+        missing_critical=missing[:1],
+        next_best_action=nba,
+        risk_flags=flags,
+    )
+
+
+# --- V5.18.5 Phase 2: policy + user-facing guidance (no LLM) ---
+
+_GUIDABLE_FOCUS = frozenset({"reach", "mediate", "report"})
+_SKIP_GUIDANCE_FOCUS = frozenset(
+    {"draft", "outreach", "language", "fair", "linkedin", "docs"}
+)
+_EARLY_BLOCKED_TOPICS = frozenset(
+    {"payment_terms", "incoterm", "customs", "freight"}
+)
+_UNSOLICITED_COMMERCIAL = re.compile(
+    r"(?i)("
+    r"\bexw\b|\bdap\b|\bfca\b|\bfob\b|\bcif\b|"
+    r"incoterm|"
+    r"pe[sş]in|"
+    r"akreditif|"
+    r"ödeme\s*[sş]art|"
+    r"g[uü]mr[uü]k|"
+    r"navlun|"
+    r"freight|"
+    r"customs"
+    r")"
+)
+_BUYER_TYPE_EVIDENCE = re.compile(
+    r"(?i)("
+    r"(hedef|as[iı]l|öncelik|öncelikli).{0,32}"
+    r"(marka|konfeksiyon|[uü]retici|toptanc[iı]|tedarik[cç]i|etiket\s*tedarik)|"
+    r"(marka|konfeksiyon|[uü]retici|toptanc[iı]|etiket\s*tedarik).{0,24}"
+    r"(hedef|istiyorum|sataca[gğ][iı]m|satmak)|"
+    r"buyer\s*type|"
+    r"hedef\s*(m[uü][sş]teri\s*)?(tip|segment|grup)"
+    r")"
+)
+
+_STAGE_TOPICS: dict[str, tuple[str, ...]] = {
+    "DISCOVERY": ("product", "intake"),
+    "PRODUCT": ("product", "market"),
+    "MARKET": ("product", "market", "customer_discovery"),
+    "CUSTOMER_IDENTIFICATION": (
+        "buyer_type",
+        "customer_channels",
+        "outreach_prep",
+    ),
+    "LEAD_QUALIFICATION": ("buyer_type", "qualification", "outreach_prep"),
+    "OUTREACH": ("message", "personalization", "sample"),
+    "SAMPLE": ("sample_logistics", "follow_up"),
+    "QUOTATION": ("price", "moq", "lead_time"),
+    "NEGOTIATION": ("negotiation", "payment_terms", "incoterm"),
+    "PAYMENT": ("payment_terms",),
+    "LOGISTICS": ("incoterm", "freight", "customs"),
+    "DELIVERY": ("delivery", "follow_up"),
+    "REPEAT_ORDER": ("repeat_order", "follow_up"),
+}
+
+
+@dataclass(frozen=True)
+class CommercialPolicy:
+    """What this turn may talk about — not session facts."""
+
+    allowed_topics: tuple[str, ...]
+    ask_missing: bool
+    nba_line: str
+    missing_question: str | None = None
+
+
+def _buyer_type_evident(question: str, session: Any = None) -> bool:
+    text = question or ""
+    if _BUYER_TYPE_EVIDENCE.search(text):
+        return True
+    if session is None:
+        return False
+    for turn in getattr(session, "messages", None) or []:
+        if getattr(turn, "role", None) != "user":
+            continue
+        if _BUYER_TYPE_EVIDENCE.search(getattr(turn, "content", "") or ""):
+            return True
+    return False
+
+
+def _market_label(session: Any = None) -> str:
+    market = _session_slot(session, "market")
+    return market or "hedef pazar"
+
+
+def _product_is_woven(session: Any = None) -> bool:
+    product = (_session_slot(session, "product") or "").casefold()
+    return "dokuma" in product and "etiket" in product
+
+
+def nba_user_line(
+    next_best_action: str,
+    *,
+    session: Any = None,
+    sales_stage: str = "",
+) -> str:
+    """Natural Turkish — never expose internal enum tokens."""
+    market = _market_label(session)
+    if next_best_action == "clarify_product":
+        return "Önce hangi ürünle ilerleyeceğinizi netleştirelim."
+    if next_best_action == "clarify_market":
+        return "Sıradaki doğru adım hedef pazarı netleştirmek."
+    if next_best_action == "identify_customer":
+        return (
+            f"Bence sıradaki doğru adım {market}'daki hedef müşteri "
+            "grubunu netleştirmek."
+        )
+    if next_best_action == "qualify_buyer":
+        return (
+            "Hedef müşteri tipini seçtikten sonra ilk temasa geçmek "
+            "daha sağlam olur."
+        )
+    if next_best_action == "prepare_outreach":
+        return (
+            "Sırada kısa ve kişiselleştirilmiş bir ilk mesaj hazırlamak var; "
+            "isterseniz birlikte yazalım."
+        )
+    if next_best_action == "send_sample":
+        return "Mesajdan sonra numune teklifiyle ilerlemek doğru adım."
+    if next_best_action == "prepare_quotation":
+        return "Numune ilgisi gelince miktar ve teklifi konuşmak mantıklı."
+    if next_best_action == "negotiate":
+        return "Teklif sonrası şartları sakin ve net konuşarak ilerleyin."
+    if next_best_action == "clarify_payment":
+        return "Ödeme şartını bu aşamada açıkça yazmak gerekir."
+    if next_best_action == "clarify_logistics":
+        return "Ödemeden sonra sevkiyat ve evrak sırasını netleştirin."
+    if next_best_action == "clarify_incoterm":
+        return "Teslim şeklini teklifte ayrıca yazın."
+    if next_best_action == "follow_up":
+        if sales_stage == "SAMPLE":
+            return "Numune sonrası kısa bir takip ile teklife geçebilirsiniz."
+        return "Kısa bir takip ile süreci sıcak tutun."
+    return ""
+
+
+def missing_critical_question(
+    missing: str,
+    *,
+    session: Any = None,
+) -> str | None:
+    if missing == "product":
+        return "Hangi ürünle ihracata başlamak istiyorsunuz?"
+    if missing == "market":
+        return "Öncelikli hedef pazarınız hangi ülke?"
+    if missing == "buyer_type":
+        if _product_is_woven(session):
+            return (
+                "Öncelikle hedefiniz marka mı, konfeksiyon üreticisi mi, "
+                "yoksa etiket tedarikçisi mi?"
+            )
+        return (
+            "Öncelikle hedef müşteri tipiniz toptancı mı, marka mı, "
+            "yoksa üretici mi?"
+        )
+    if missing == "capacity":
+        return "Aylık üretim kapasiteniz kabaca ne kadar?"
+    return None
+
+
+def should_ask_missing(
+    situation: CommercialSituation,
+    *,
+    question: str = "",
+    focus: str | None = None,
+) -> bool:
+    """At most one commercial question; never questionnaire; skip locked drafts."""
+    kind = (focus or "").strip()
+    if kind in _SKIP_GUIDANCE_FOCUS:
+        return False
+    if not situation.missing_critical:
+        return False
+    gap = situation.missing_critical[0]
+    # Capacity is observational on outreach/sample — don't interrupt draft/sample.
+    if gap == "capacity":
+        return False
+    # T2 already explains segments; don't re-ask while answering customer-find.
+    if gap == "buyer_type" and (
+        situation.sales_stage == "CUSTOMER_IDENTIFICATION"
+        or is_customer_find_ask(question or "")
+    ):
+        return False
+    if situation.sales_stage in ("OUTREACH", "SAMPLE", "PAYMENT", "LOGISTICS"):
+        return False
+    return True
+
+
+def build_commercial_policy(
+    situation: CommercialSituation,
+    *,
+    question: str = "",
+    session: Any = None,
+    focus: str | None = None,
+) -> CommercialPolicy:
+    stage = situation.sales_stage
+    topics = _STAGE_TOPICS.get(stage, ("general",))
+    # Early journey: never open payment/Incoterm/customs/freight.
+    if stage in (
+        "DISCOVERY",
+        "PRODUCT",
+        "MARKET",
+        "CUSTOMER_IDENTIFICATION",
+        "LEAD_QUALIFICATION",
+        "OUTREACH",
+        "SAMPLE",
+    ):
+        topics = tuple(t for t in topics if t not in _EARLY_BLOCKED_TOPICS)
+    ask = should_ask_missing(situation, question=question, focus=focus)
+    question_txt: str | None = None
+    if ask and situation.missing_critical:
+        question_txt = missing_critical_question(
+            situation.missing_critical[0], session=session
+        )
+    nba = nba_user_line(
+        situation.next_best_action,
+        session=session,
+        sales_stage=stage,
+    )
+    return CommercialPolicy(
+        allowed_topics=topics,
+        ask_missing=bool(ask and question_txt),
+        nba_line=nba,
+        missing_question=question_txt if ask else None,
+    )
+
+
+def apply_commercial_guidance(
+    advice: str,
+    situation: CommercialSituation,
+    question: str,
+    *,
+    session: Any = None,
+    focus: str | None = None,
+) -> str:
+    """Append natural NBA (+ optional one question). Never invents commercial facts."""
+    body = (advice or "").rstrip()
+    if not body:
+        return advice
+    kind = (focus or "").strip() or advisor_focus(question or "", session)
+    if kind in _SKIP_GUIDANCE_FOCUS:
+        return body
+    if situation.sales_stage in ("OUTREACH", "SAMPLE") and kind != "reach":
+        return body
+    if kind not in _GUIDABLE_FOCUS and situation.sales_stage not in (
+        "DISCOVERY",
+        "PRODUCT",
+        "MARKET",
+        "CUSTOMER_IDENTIFICATION",
+        "LEAD_QUALIFICATION",
+        "QUOTATION",
+    ):
+        return body
+
+    policy = build_commercial_policy(
+        situation, question=question, session=session, focus=kind
+    )
+    parts = [body]
+    nba = (policy.nba_line or "").strip()
+    if nba and nba.casefold() not in body.casefold():
+        # Refuse to inject early blocked commercial topics.
+        if not _UNSOLICITED_COMMERCIAL.search(nba):
+            parts.append(nba)
+    if policy.ask_missing and policy.missing_question:
+        q = policy.missing_question.strip()
+        existing_qs = body.count("?")
+        if q and existing_qs < 1 and q.casefold() not in body.casefold():
+            if not _UNSOLICITED_COMMERCIAL.search(q):
+                parts.append(q)
+    guided = "\n\n".join(parts)
+    # Hard safety: guidance must not invent markets/capacity facts into slots —
+    # text-only append. Strip accidental internal enum leaks.
+    for token in (
+        "identify_customer",
+        "qualify_buyer",
+        "prepare_outreach",
+        "send_sample",
+        "prepare_quotation",
+        "next_best_action",
+        "missing_critical",
+        "sales_stage",
+    ):
+        if token in guided:
+            guided = guided.replace(token, "")
+    return guided.strip()
+
+
+# --- V5.18.5 Phase 4: Commercial Judgment / Persona (LLM brief only) ---
+
+_BLAST_OUTREACH = re.compile(
+    r"(?i)("
+    r"herkese\s+(ayn[iı]\s+)?(mesaj|mail|e-?posta)|"
+    r"ayn[iı]\s+mesaj[iı]?\s+(herkese|g[oö]nder)|"
+    r"toplu\s+(mail|mesaj)|"
+    r"blast\s+(mail|message)"
+    r")"
+)
+_PRICE_BEFORE_CUSTOMER = re.compile(
+    r"(?i)("
+    r"[oö]nce\s+(?:\S+\s+){0,3}(fiyat|teklif).{0,48}"
+    r"(m[uü][sş]teri|al[iı]c[iı]|g[oö]nder)|"
+    r"(fiyat[iı]?|teklif(?:i)?)\s*(g[oö]nder|at).{0,40}"
+    r"(sonra|ard[iı]ndan).{0,24}(m[uü][sş]teri|bul)"
+    r")"
+)
+
+_STAGE_MATURITY: dict[str, str] = {
+    "DISCOVERY": "Keşif: ürün/pazar netleşmeden checklist açma.",
+    "PRODUCT": "Ürün net; pazar veya müşteri tipine yönlen.",
+    "MARKET": "Pazar keşfi ≠ müşteri listesi; önce uygun segment.",
+    "CUSTOMER_IDENTIFICATION": (
+        "Müşteri keşfi: tip + kanal; T1 pazar girişini tekrar etme."
+    ),
+    "LEAD_QUALIFICATION": "Nitelendirme: ciddi alıcı ayrımı; toplu spam önerme.",
+    "OUTREACH": "Outreach: kişiselleştirilmiş ilk mesaj; numune teklifine hazırlan.",
+    "SAMPLE": "Numune lojistiği; müşteri bulma anlatısına geri dönme.",
+    "QUOTATION": "Teklif: MOQ/fiyat yalnızca sorulursa veya bu aşamada.",
+    "NEGOTIATION": "Pazarlık: nazik ama net; uydurma şart yok.",
+    "PAYMENT": "Ödeme: yalnızca bu soruda; erken checklist yoktu.",
+    "LOGISTICS": "Lojistik/Incoterm: soruya cevap ver; pazar özetine kayma.",
+    "DELIVERY": "Teslimat takibi; yeni satış hunisine sıfırlama.",
+    "REPEAT_ORDER": "Tekrar sipariş: ilişkiyi koru, abartılı vaat yok.",
+}
+
+
+@dataclass(frozen=True)
+class CommercialJudgmentKit:
+    """Compact persona + judgment for LLM — not session facts, not a FSM."""
+
+    tone: str
+    maturity_hint: str
+    challenge_hint: str = ""
+    discipline: tuple[str, ...] = ()
+
+    def as_prompt_lines(self) -> list[str]:
+        lines = [
+            "TİCARİ MUHAKEME (iç rehber; kullanıcıya başlık/etiket basma):",
+            "- Ton: " + self.tone,
+            "- Aşama olgunluğu: " + self.maturity_hint,
+        ]
+        if self.challenge_hint:
+            lines.append("- Varsayım uyarısı: " + self.challenge_hint)
+        for item in self.discipline:
+            lines.append("- " + item)
+        return lines
+
+
+def detect_weak_commercial_assumption(question: str) -> str:
+    """Soft flags for judgment — not user-facing fixed replies."""
+    text = question or ""
+    if _BLAST_OUTREACH.search(text):
+        return (
+            "Kullanıcı toplu/aynı mesaj eğiliminde. Onaylama; seçici ve "
+            "kişiselleştirilmiş yaklaşımı nazikçe öner."
+        )
+    if _PRICE_BEFORE_CUSTOMER.search(text):
+        return (
+            "Fiyat/teklifi müşteri tipinden önce gönderme varsayımı var. "
+            "Neden riskli olduğunu kısaca söyle; daha mantıklı sırayı öner."
+        )
+    return ""
+
+
+def build_commercial_judgment_kit(
+    situation: CommercialSituation,
+    *,
+    policy: CommercialPolicy | None = None,
+    question: str = "",
+    session: Any = None,
+) -> CommercialJudgmentKit:
+    """Short high-signal kit. Does not repeat Phase 3 hallucination dump."""
+    del session  # reserved; slots already in situation/policy
+    stage = situation.sales_stage
+    maturity = _STAGE_MATURITY.get(
+        stage, "Soruya doğrudan cevap ver; checklist dump etme."
+    )
+    challenge = detect_weak_commercial_assumption(question)
+    ask_note = (
+        "Soru yalnızca cevabı gerçekten değiştiriyorsa; aksi halde sorma."
+        if not (policy and policy.ask_missing)
+        else "En fazla bir kritik soru; questionnaire yok."
+    )
+    discipline = (
+        "Sıcak, profesyonel, deneyimli; robotik template ve emoji yok.",
+        "Kanıtsız «kesin/garanti/mutlaka satar» yok; ihtiyatlı ama faydalı ol.",
+        "Liste değil öncelik: deneyimli danışman gibi yönlendir.",
+        "NBA'yi mekanik footer yapma; doğal ticari yön olarak kullan.",
+        "Yanlış ticari varsayımı kör onaylama; küçümsemeden düzelt.",
+        ask_note,
+        "Bilgi vs aksiyon, pazar vs müşteri, keşif vs outreach ayrımını koru.",
+    )
+    tone = (
+        "sıcak + profesyonel + deneyimli + gerçekçi + eylem odaklı "
+        "(İstanbul Türkçesi)"
+    )
+    return CommercialJudgmentKit(
+        tone=tone,
+        maturity_hint=maturity,
+        challenge_hint=challenge,
+        discipline=discipline,
+    )

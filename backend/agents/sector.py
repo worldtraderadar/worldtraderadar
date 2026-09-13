@@ -35,7 +35,7 @@ async def run_sector_chat(
         account_slug=getattr(deps, "account_slug", "demo"),
         question=question,
     )
-    facts = session_notes(deps.session) or "Kayıtlı şirket slotu yok."
+    facts = session_notes(deps.session, question=question) or "Kayıtlı şirket slotu yok."
     advice = await compose_consultant_reply(
         generate=deps.generate,
         http=deps.http,
@@ -49,7 +49,7 @@ async def run_sector_chat(
     if not (advice or "").strip():
         advice = await deps.generate(
             deps.http,
-            build_user_turn(question, pack.as_system_block() or session_notes(deps.session)),
+            build_user_turn(question, pack.as_system_block() or session_notes(deps.session, question=question)),
             system_prompt=SECTOR_PROMPT,
         )
     current.status = "success"

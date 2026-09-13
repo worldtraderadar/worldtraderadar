@@ -6,7 +6,15 @@ import re
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
-from .session import SessionState, _fold, product_kind, strip_query_noise, wants_toy_event_notes
+from .session import (
+    SessionState,
+    _fold,
+    product_kind,
+    stale_session_product_conflict,
+    strip_query_noise,
+    utterance_product,
+    wants_toy_event_notes,
+)
 
 # Sorgu kökü → gömme genişletmesi + kart filtresi
 _PRODUCT_PROFILES: list[tuple[tuple[str, ...], str, frozenset[str]]] = [
@@ -171,11 +179,29 @@ _PRINT3D_CHANNELS: tuple[dict[str, str], ...] = (
 )
 
 
-def _product_from_session(session: SessionState | None, question: str) -> str:
-    if session and session.product:
-        return session.product.strip()
+def active_retrieval_product(session: SessionState | None, question: str) -> str:
+    """Retrieval ürünü: current utterance, stale session slot'undan önce.
+
+    Same-domain / generic devam → session.product kullanılabilir.
+    Explicit product switch veya named-kind conflict → current question.
+    """
+    stale = (session.product.strip() if session and session.product else "")
+    incoming = utterance_product(question)
+    if stale and stale_session_product_conflict(stale, question):
+        if incoming:
+            return incoming
+        cleaned = strip_query_noise(question or "")
+        return cleaned or (question or "").strip()
+    if stale:
+        return stale
+    if incoming:
+        return incoming
     cleaned = strip_query_noise(question or "")
     return cleaned or (question or "").strip()
+
+
+def _product_from_session(session: SessionState | None, question: str) -> str:
+    return active_retrieval_product(session, question)
 
 
 def expand_product_query(product: str) -> str:
@@ -316,6 +342,9 @@ def item_matches_product(item: Any, product: str) -> bool:
         if any(token in blob or token in label for token in _STEEL_CORE):
             return True
         return any(token in label for token in _STEEL_CHANNEL)
+    if kind == "woven":
+        if _OLIVE_CROSS.search(blob) or _OLIVE_CROSS.search(label):
+            return False
     needles = product_needles(product)
     if not needles:
         return True

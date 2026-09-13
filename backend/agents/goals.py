@@ -17,6 +17,7 @@ from prompts import (
     is_small_talk,
     is_strategy_request,
     is_supplier_search,
+    is_trade_docs_ask,
     wants_technical_detail,
 )
 
@@ -53,6 +54,8 @@ def classify_goal(question: str, session: SessionState | None = None) -> Commerc
         return "casual_conversation"
     if is_memory_recall(text):
         return "memory_recall"
+    if is_trade_docs_ask(text):
+        return "export_strategy"
     if is_document_ask(text) or is_diagnostic_request(text):
         if is_document_ask(text):
             return "document_analysis"

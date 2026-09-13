@@ -6,7 +6,12 @@ from prompts import INTAKE_REPLY, MATCHING_PROMPT, build_user_turn, is_general_i
 
 from .context_pack import build_context_pack
 from .response_engine import compose_consultant_reply
-from .retrieve import enrich_matches_for_product, gather_match_rows, retrieval_query
+from .retrieve import (
+    active_retrieval_product,
+    enrich_matches_for_product,
+    gather_match_rows,
+    retrieval_query,
+)
 from .session import in_progress, session_notes
 from .tools_registry import matches_as_tool
 from .types import AgentDeps, AgentStep
@@ -46,17 +51,17 @@ async def run_product_matching(
     await emit(embed_step)
 
     match_step = await step("retrieve", "Semantik ürün eşleştirme")
+    product = active_retrieval_product(deps.session, question)
     rows = await gather_match_rows(
         match=deps.match,
         supabase=deps.supabase,
         embedding=embedding,
-        product=deps.session.product if deps.session is not None else question,
+        product=product or question,
         match_count=max(deps.match_count, 16),
         match_threshold=max(deps.match_threshold, 0.42),
         organization_id=deps.organization_id,
     )
-    product = deps.session.product if deps.session is not None else question
-    filtered, _notes = enrich_matches_for_product(rows, product, role="match")
+    filtered, _notes = enrich_matches_for_product(rows, product or question, role="match")
     matches = [deps.match_model.model_validate(row) for row in filtered]
     match_step.status = "success"
     match_step.detail = f"{len(matches)} aday ürün sıralandı."
@@ -64,7 +69,12 @@ async def run_product_matching(
 
     gen_step = await step("advise", "Ticari uygunluk")
     facts = "\n".join(
-        p for p in (session_notes(deps.session), deps.format_context(matches)) if p
+        p
+        for p in (
+            session_notes(deps.session, question=question),
+            deps.format_context(matches),
+        )
+        if p
     ) or "Eşleşen ürün kaydı yok. Uydurma HS veya ürün yok."
     pack = await build_context_pack(
         supabase=deps.supabase,

@@ -3,23 +3,34 @@ from __future__ import annotations
 import re
 
 from prompts import (
+    is_buyer_firm_hunt,
     is_buyer_search,
+    is_commercial_start,
     is_company_data_ask,
     is_current_information,
+    is_customer_find_ask,
     is_decision_question,
     is_diagnostic_request,
     is_document_ask,
     is_draft_request,
     is_general_intake,
+    is_incoterm_ask,
     is_language_barrier,
     is_memory_recall,
     is_method_question,
+    is_mixed_commercial_start,
+    is_payment_ask,
     is_planning_ask,
+    is_reach_language_mix,
+    is_ratio_ask,
+    is_sample_ask,
     is_small_talk,
     is_sell_request,
+    is_stage_followup,
     is_stat_challenge,
     is_strategy_request,
     is_supplier_search,
+    is_trade_docs_ask,
     wants_data_search,
 )
 
@@ -125,6 +136,29 @@ def classify_intent(
     slots_open = bool(session and session.slots_open() and session.product)
 
     if is_buyer_search(question) and not is_decision_question(question):
+        if (
+            is_draft_request(question)
+            or is_sample_ask(question)
+            or is_language_barrier(question)
+        ):
+            if session is not None:
+                session.last_ask = None
+            return "trade_advisor", {**empty, "trade_advisor": 1}
+        if (
+            is_commercial_start(question)
+            or is_mixed_commercial_start(question)
+            or is_reach_language_mix(question)
+        ):
+            if session is not None:
+                session.last_ask = None
+            return "trade_advisor", {**empty, "trade_advisor": 1}
+        if is_customer_find_ask(question) and session is not None and session.product:
+            session.last_ask = None
+            return "trade_advisor", {**empty, "trade_advisor": 1}
+        if session is not None:
+            session.last_ask = None
+        return "buyer_finder", {**empty, "buyer_finder": 1}
+    if is_buyer_firm_hunt(question) and not is_decision_question(question):
         if session is not None:
             session.last_ask = None
         return "buyer_finder", {**empty, "buyer_finder": 1}
@@ -136,6 +170,7 @@ def classify_intent(
         is_memory_recall(question)
         or is_diagnostic_request(question)
         or is_document_ask(question)
+        or is_trade_docs_ask(question)
         or is_decision_question(question)
         or is_company_data_ask(question)
         or is_stat_challenge(question)
@@ -150,7 +185,11 @@ def classify_intent(
         or is_method_question(question)
         or is_language_barrier(question)
         or is_draft_request(question)
+        or is_sample_ask(question)
         or is_sell_request(question)
+        or is_payment_ask(question)
+        or is_ratio_ask(question)
+        or is_incoterm_ask(question)
     ):
         if session is not None:
             session.last_ask = None
@@ -164,10 +203,30 @@ def classify_intent(
             return picked, {**empty, picked: 1}
         session.last_ask = None
         return "trade_advisor", {**empty, "trade_advisor": 1}
+    if (
+        session
+        and session.product
+        and session.last_advisor_kind
+        and is_stage_followup(question)
+        and not is_buyer_search(question)
+        and not is_supplier_search(question)
+        and not is_buyer_firm_hunt(question)
+    ):
+        return "trade_advisor", {**empty, "trade_advisor": 1}
     if awaiting:
         return "intake", {**empty, "intake": 1}
     if slots_open and not wants_data_search(question):
         return "intake", {**empty, "intake": 1}
+    if (
+        session
+        and session.product
+        and session.last_advisor_kind
+        and not is_buyer_search(question)
+        and not is_supplier_search(question)
+        and not is_buyer_firm_hunt(question)
+        and not wants_data_search(question)
+    ):
+        return "trade_advisor", {**empty, "trade_advisor": 1}
     if is_small_talk(question, has_history=has_history, awaiting=awaiting):
         return "chat", {**empty, "chat": 1}
     if is_general_intake(question) and not (session and session.product):
