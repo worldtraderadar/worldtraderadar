@@ -9,7 +9,6 @@ from starlette.types import ASGIApp
 
 from .engine import (
     QuotaExceeded,
-    account_slug_from_headers,
     consume_quota,
     get_snapshot,
 )
@@ -67,8 +66,21 @@ class QuotaMiddleware(BaseHTTPMiddleware):
         if request.method != "POST" or path not in METERED_PATHS:
             return await call_next(request)
 
-        supabase = await self.get_supabase(request)
-        slug = account_slug_from_headers(request.headers)
+        try:
+            supabase = await self.get_supabase(request)
+        except Exception:
+            supabase = None
+        principal = getattr(request.state, "auth", None)
+        if principal is None:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required."},
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
+            )
+        slug = principal.account_slug
         request.state.account_slug = slug
         init_token_meter()
 

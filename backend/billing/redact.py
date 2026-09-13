@@ -5,14 +5,20 @@ from typing import Any, Iterable
 from supabase import AsyncClient
 from starlette.requests import Request
 
-from .engine import account_slug_from_headers, get_snapshot
+from .engine import get_snapshot
 
 VOLUME_FIELDS = ("quantity", "value_usd")
 CONTACT_FIELDS = ("contact_email", "website", "tax_id")
 
 
 async def plan_id_for_request(request: Request, supabase: AsyncClient | None) -> str:
-    slug = account_slug_from_headers(request.headers)
+    principal = getattr(request.state, "auth", None)
+    if principal is not None and getattr(principal, "plan_id", None):
+        return str(principal.plan_id)
+    # Fallback only when auth middleware has set trusted slug (never raw header).
+    slug = getattr(request.state, "account_slug", None)
+    if not slug:
+        return "free"
     snapshot = await get_snapshot(supabase, slug)
     return snapshot.plan_id
 

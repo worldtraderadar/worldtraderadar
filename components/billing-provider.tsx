@@ -9,6 +9,7 @@ import {
   useState,
   type ReactNode,
 } from "react"
+import { useAuth } from "@/components/auth-provider"
 import { getBillingMe, type BillingSnapshot } from "@/lib/api"
 import { QUOTA_EVENT } from "@/lib/quota"
 
@@ -28,12 +29,18 @@ type BillingContextValue = {
 const BillingContext = createContext<BillingContextValue | null>(null)
 
 export function BillingProvider({ children }: { children: ReactNode }) {
+  const { status } = useAuth()
   const [snapshot, setSnapshot] = useState<BillingSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
   const [paywallOpen, setPaywallOpen] = useState(false)
   const [paywallReason, setPaywallReason] = useState<PaywallReason>("contact")
 
   const refresh = useCallback(async () => {
+    if (status !== "authenticated") {
+      setSnapshot(null)
+      setLoading(false)
+      return
+    }
     try {
       setSnapshot(await getBillingMe())
     } catch {
@@ -41,15 +48,20 @@ export function BillingProvider({ children }: { children: ReactNode }) {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [status])
 
   useEffect(() => {
-    void refresh()
+    const timer = window.setTimeout(() => {
+      void refresh()
+    }, 0)
     const onChange = () => {
       void refresh()
     }
     window.addEventListener(QUOTA_EVENT, onChange)
-    return () => window.removeEventListener(QUOTA_EVENT, onChange)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener(QUOTA_EVENT, onChange)
+    }
   }, [refresh])
 
   const value = useMemo<BillingContextValue>(

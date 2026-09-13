@@ -1400,7 +1400,14 @@ class ChatTurn:
 
 
 @dataclass
+class SessionAccessDenied(Exception):
+    """Cross-account session access — map to HTTP 404 at the API edge."""
+
+
 class SessionState:
+    # Pilot Security Phase 1: ownership metadata (commercial slots unchanged).
+    account_id: str | None = None
+    created_by_user_id: str | None = None
     session_id: str
     name: str | None = None
     product: str | None = None
@@ -1651,6 +1658,8 @@ def session_title(session: SessionState | None) -> str:
 def session_snapshot(session: SessionState) -> dict[str, Any]:
     return {
         "session_id": session.session_id,
+        "account_id": session.account_id,
+        "created_by_user_id": session.created_by_user_id,
         "title": session_title(session),
         "product": session.product,
         "capacity": session.capacity,
@@ -1661,11 +1670,19 @@ def session_snapshot(session: SessionState) -> dict[str, Any]:
     }
 
 
-def create_session() -> SessionState:
-    """Yeni izole oturum: taze session_id, boş niyet/kapasite."""
+def create_session(
+    *,
+    account_id: str | None = None,
+    created_by_user_id: str | None = None,
+) -> SessionState:
+    """Yeni izole oturum: taze session_id, boş niyet/kapasite (+ ownership)."""
     sid = str(uuid4())
     with _LOCK:
-        state = SessionState(session_id=sid)
+        state = SessionState(
+            session_id=sid,
+            account_id=(account_id or None),
+            created_by_user_id=(created_by_user_id or None),
+        )
         _STORE[sid] = state
         return state
 
@@ -1678,33 +1695,83 @@ def get_session(session_id: str | None) -> SessionState | None:
         return _STORE.get(sid)
 
 
-def list_sessions() -> list[dict[str, Any]]:
+def session_owned_by(session: SessionState | None, account_id: str | None) -> bool:
+    if session is None or not account_id:
+        return False
+    owned = (session.account_id or "").strip()
+    return bool(owned) and owned == account_id.strip()
+
+
+def get_session_for_account(
+    session_id: str | None, account_id: str | None
+) -> SessionState | None:
+    """Return session only when it belongs to account_id; else None (→ 404)."""
+    state = get_session(session_id)
+    if state is None:
+        return None
+    if not session_owned_by(state, account_id):
+        return None
+    return state
+
+
+def list_sessions(account_id: str | None = None) -> list[dict[str, Any]]:
     with _LOCK:
-        rows = [
-            session_snapshot(state)
-            for state in _STORE.values()
-            if state.messages or state.product or state.capacity or state.stock
-        ]
+        rows = []
+        for state in _STORE.values():
+            if not (state.messages or state.product or state.capacity or state.stock):
+                continue
+            if account_id and not session_owned_by(state, account_id):
+                continue
+            rows.append(session_snapshot(state))
     return list(reversed(rows))
 
 
-def delete_session(session_id: str | None) -> bool:
-    """Oturumu bellekten siler. Yoksa False döner (idempotent çağrı için)."""
+def delete_session(
+    session_id: str | None,
+    *,
+    account_id: str | None = None,
+) -> bool:
+    """Oturumu bellekten siler. account_id verilirse ownership zorunlu."""
     sid = (session_id or "").strip()
     if not sid:
         return False
     with _LOCK:
-        return _STORE.pop(sid, None) is not None
+        state = _STORE.get(sid)
+        if state is None:
+            return False
+        if account_id is not None and not session_owned_by(state, account_id):
+            return False
+        _STORE.pop(sid, None)
+        return True
 
 
-def hydrate(session_id: str | None, history: list[Any] | None) -> SessionState:
+def hydrate(
+    session_id: str | None,
+    history: list[Any] | None,
+    *,
+    account_id: str | None = None,
+    created_by_user_id: str | None = None,
+    enforce_ownership: bool = False,
+) -> SessionState:
     sid = (session_id or "").strip() or str(uuid4())
     incoming = _normalize_history(history)
     with _LOCK:
         state = _STORE.get(sid)
         if state is None:
-            state = SessionState(session_id=sid)
+            state = SessionState(
+                session_id=sid,
+                account_id=account_id,
+                created_by_user_id=created_by_user_id,
+            )
             _STORE[sid] = state
+        elif enforce_ownership:
+            existing = (state.account_id or "").strip()
+            wanted = (account_id or "").strip()
+            if existing and wanted and existing != wanted:
+                raise SessionAccessDenied(sid)
+            if not existing and wanted:
+                state.account_id = wanted
+                state.created_by_user_id = created_by_user_id
         if history is not None:
             _clear_slots(state)
             state.messages = incoming

@@ -6,12 +6,20 @@ export async function POST(request: NextRequest) {
     ""
   )
   const body = await request.text()
+  const authorization = request.headers.get("authorization")
+  if (!authorization) {
+    return Response.json(
+      { detail: "Authentication required." },
+      { status: 401 }
+    )
+  }
+
   const upstream = await fetch(`${api}/speak`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "audio/wav",
-      "X-Account-Slug": request.headers.get("X-Account-Slug") ?? "demo",
+      Authorization: authorization,
     },
     body,
     signal: AbortSignal.timeout(180_000),

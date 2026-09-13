@@ -1,22 +1,17 @@
 import { notifyQuotaChanged } from "@/lib/quota"
+import { getSupabaseBrowserClient } from "@/lib/supabase/client"
 
 const API_URL = (
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"
 ).replace(/\/$/, "")
 
-const ACCOUNT_SLUG_KEY = "wtr-account-slug"
-
-export function getAccountSlug() {
-  if (typeof window === "undefined") return "demo"
-  try {
-    return window.localStorage.getItem(ACCOUNT_SLUG_KEY) || "demo"
-  } catch {
-    return "demo"
-  }
-}
-
-function accountHeaders(): Record<string, string> {
-  return { "X-Account-Slug": getAccountSlug() }
+async function authHeaders(): Promise<Record<string, string>> {
+  const client = getSupabaseBrowserClient()
+  if (!client) return {}
+  const { data } = await client.auth.getSession()
+  const token = data.session?.access_token
+  if (!token) return {}
+  return { Authorization: `Bearer ${token}` }
 }
 
 export type QuotaExceededDetail = {
@@ -249,7 +244,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...accountHeaders(),
+      ...(await authHeaders()),
       ...(init?.headers ?? {}),
     },
   })
@@ -282,7 +277,7 @@ export async function fetchSpeakAudio(text: string) {
     headers: {
       "Content-Type": "application/json",
       Accept: "audio/wav",
-      ...accountHeaders(),
+      ...(await authHeaders()),
     },
     body: JSON.stringify({ text, lang: "tr" }),
     signal: AbortSignal.timeout(180_000),
@@ -348,7 +343,7 @@ export async function consultStream(
     headers: {
       "Content-Type": "application/json",
       Accept: "text/event-stream",
-      ...accountHeaders(),
+      ...(await authHeaders()),
     },
     body: JSON.stringify(consultBody(input)),
     signal,
@@ -473,6 +468,18 @@ export async function listConsultHistory(limit = 50) {
 
 export function getBillingMe() {
   return request<BillingSnapshot>("/billing/me")
+}
+
+export type AuthMeResponse = {
+  user_id: string
+  account_id: string
+  account_slug: string
+  role: string
+  plan_id: string
+}
+
+export function getAuthMe() {
+  return request<AuthMeResponse>("/auth/me")
 }
 
 export function getBillingPlans() {

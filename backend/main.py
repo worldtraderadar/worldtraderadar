@@ -22,9 +22,10 @@ from supabase import AsyncClient, create_async_client
 
 from agents import fail_run, run_orchestrator
 from agents.session import (
+    SessionAccessDenied,
     create_session,
     delete_session,
-    get_session,
+    get_session_for_account,
     hydrate,
     list_sessions,
     session_notes,
@@ -32,10 +33,10 @@ from agents.session import (
     session_title,
 )
 from agents.types import AgentDeps, AgentStep
+from auth import AuthMiddleware, require_principal
 from billing import (
     QuotaExceeded,
     QuotaMiddleware,
-    account_slug_from_headers,
     add_tokens,
     confirm_checkout,
     consume_quota,
@@ -480,27 +481,33 @@ async def log_agent(
     duration_ms: int | None = None,
     organization_id: UUID | None = None,
     trade_item_id: UUID | None = None,
+    account_id: str | None = None,
 ) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {
+        "agent_name": AGENT_NAME,
+        "action": action,
+        "status": status,
+        "input": dict(input_data or {}),
+        "output": output_data or {},
+        "error_message": error_message,
+        "duration_ms": duration_ms,
+        "organization_id": str(organization_id) if organization_id else None,
+        "trade_item_id": str(trade_item_id) if trade_item_id else None,
+    }
+    if account_id:
+        payload["account_id"] = account_id
+        payload["input"] = {**payload["input"], "account_id": account_id}
     try:
-        result = await (
-            supabase.table("agent_logs")
-            .insert(
-                {
-                    "agent_name": AGENT_NAME,
-                    "action": action,
-                    "status": status,
-                    "input": input_data or {},
-                    "output": output_data or {},
-                    "error_message": error_message,
-                    "duration_ms": duration_ms,
-                    "organization_id": str(organization_id) if organization_id else None,
-                    "trade_item_id": str(trade_item_id) if trade_item_id else None,
-                }
-            )
-            .execute()
-        )
+        result = await supabase.table("agent_logs").insert(payload).execute()
         return (result.data or [None])[0]
     except Exception:
+        if "account_id" in payload:
+            payload.pop("account_id", None)
+            try:
+                result = await supabase.table("agent_logs").insert(payload).execute()
+                return (result.data or [None])[0]
+            except Exception:
+                return None
         return None
 
 
@@ -736,9 +743,8 @@ async def flush_stream_tokens(request: Request, supabase: AsyncClient | None) ->
     used = take_tokens()
     if not used:
         return
-    slug = getattr(request.state, "account_slug", None) or account_slug_from_headers(
-        request.headers
-    )
+    principal = require_principal(request)
+    slug = principal.account_slug
     try:
         await consume_quota(supabase, slug, searches=0, tokens=used)
     except QuotaExceeded:
@@ -850,6 +856,7 @@ app = FastAPI(
 )
 
 app.add_middleware(QuotaMiddleware, get_supabase=get_supabase)
+app.add_middleware(AuthMiddleware, get_supabase=get_supabase)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -976,9 +983,6 @@ async def speak(body: SpeakRequest) -> Response:
             "Cache-Control": "private, max-age=1200",
         },
     )
-            "Cache-Control": "private, max-age=1200",
-        },
-    )
 
 
 @app.get("/billing/plans")
@@ -988,11 +992,24 @@ async def billing_plans(request: Request) -> dict[str, Any]:
     return {"plans": plans}
 
 
+@app.get("/auth/me")
+async def auth_me(request: Request) -> dict[str, Any]:
+    """Trusted account context from JWT → membership (not client-selected)."""
+    principal = require_principal(request)
+    return {
+        "user_id": principal.user_id,
+        "account_id": principal.account_id,
+        "account_slug": principal.account_slug,
+        "role": principal.role,
+        "plan_id": principal.plan_id,
+    }
+
+
 @app.get("/billing/me")
 async def billing_me(request: Request) -> dict[str, Any]:
+    principal = require_principal(request)
     supabase = await get_supabase_optional(request)
-    slug = account_slug_from_headers(request.headers)
-    snapshot = await get_snapshot(supabase, slug)
+    snapshot = await get_snapshot(supabase, principal.account_slug)
     return snapshot.to_dict()
 
 
@@ -1000,10 +1017,10 @@ async def billing_me(request: Request) -> dict[str, Any]:
 async def billing_checkout(
     body: BillingCheckoutRequest, request: Request
 ) -> dict[str, Any]:
+    principal = require_principal(request)
     supabase = await get_supabase_optional(request)
-    slug = account_slug_from_headers(request.headers)
     try:
-        session = await start_checkout(supabase, slug, body.plan_id)
+        session = await start_checkout(supabase, principal.account_slug, body.plan_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return session
@@ -1013,10 +1030,12 @@ async def billing_checkout(
 async def billing_checkout_confirm(
     body: BillingConfirmRequest, request: Request
 ) -> dict[str, Any]:
+    principal = require_principal(request)
     supabase = await get_supabase_optional(request)
-    slug = account_slug_from_headers(request.headers)
     try:
-        session, snapshot = await confirm_checkout(supabase, slug, body.checkout_id)
+        session, snapshot = await confirm_checkout(
+            supabase, principal.account_slug, body.checkout_id
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"checkout": session, "account": snapshot.to_dict()}
@@ -1028,9 +1047,11 @@ async def billing_change_plan(
 ) -> dict[str, Any]:
     if body.plan_id not in {"free", "pro"}:
         raise HTTPException(status_code=400, detail="Plan free veya pro olmalı.")
+    principal = require_principal(request)
     supabase = await get_supabase_optional(request)
-    slug = account_slug_from_headers(request.headers)
-    snapshot = await set_plan(supabase, slug, body.plan_id)
+    snapshot = await set_plan(supabase, principal.account_slug, body.plan_id)
+    # Keep in-request principal plan in sync for subsequent redact in same process
+    # (membership memory / next request will reload from DB).
     return snapshot.to_dict()
 
 
@@ -1046,6 +1067,7 @@ async def embed(body: EmbedRequest, request: Request) -> EmbedResponse:
 
 @app.post("/search", response_model=SearchResponse)
 async def search(body: SearchRequest, request: Request) -> SearchResponse:
+    principal = require_principal(request)
     supabase = await get_supabase(request)
     started = time.perf_counter()
     try:
@@ -1062,10 +1084,14 @@ async def search(body: SearchRequest, request: Request) -> SearchResponse:
             supabase,
             action="search",
             status="error",
-            input_data=body.model_dump(mode="json"),
+            input_data={
+                **body.model_dump(mode="json"),
+                "account_id": principal.account_id,
+            },
             error_message=str(exc.detail),
             duration_ms=int((time.perf_counter() - started) * 1000),
             organization_id=body.organization_id,
+            account_id=principal.account_id,
         )
         raise
     except Exception as exc:
@@ -1073,10 +1099,14 @@ async def search(body: SearchRequest, request: Request) -> SearchResponse:
             supabase,
             action="search",
             status="error",
-            input_data=body.model_dump(mode="json"),
+            input_data={
+                **body.model_dump(mode="json"),
+                "account_id": principal.account_id,
+            },
             error_message=str(exc),
             duration_ms=int((time.perf_counter() - started) * 1000),
             organization_id=body.organization_id,
+            account_id=principal.account_id,
         )
         raise HTTPException(
             status_code=502,
@@ -1089,16 +1119,32 @@ async def search(body: SearchRequest, request: Request) -> SearchResponse:
         supabase,
         action="search",
         status="success",
-        input_data=body.model_dump(mode="json"),
+        input_data={
+            **body.model_dump(mode="json"),
+            "account_id": principal.account_id,
+        },
         output_data={"result_count": len(results)},
         duration_ms=int((time.perf_counter() - started) * 1000),
         organization_id=body.organization_id,
+        account_id=principal.account_id,
     )
     return SearchResponse(query=body.query, model=OLLAMA_EMBED_MODEL, results=results)
 
 
 @app.post("/consult", response_model=ConsultResponse)
 async def consult(body: ConsultRequest, request: Request) -> ConsultResponse:
+    principal = require_principal(request)
+    if body.session_id:
+        try:
+            hydrate(
+                body.session_id,
+                None,
+                account_id=principal.account_id,
+                created_by_user_id=principal.user_id,
+                enforce_ownership=True,
+            )
+        except SessionAccessDenied:
+            raise HTTPException(status_code=404, detail="Oturum bulunamadı.") from None
     supabase = await get_supabase(request)
     http = get_http(request)
     started = time.perf_counter()
@@ -1107,19 +1153,26 @@ async def consult(body: ConsultRequest, request: Request) -> ConsultResponse:
             body,
             http,
             supabase,
-            account_slug=getattr(request.state, "account_slug", None)
-            or account_slug_from_headers(request.headers),
+            account_slug=principal.account_slug,
+            account_id=principal.account_id,
+            user_id=principal.user_id,
         )
         response.context = await paywall_matches(request, supabase, response.context)
+    except SessionAccessDenied:
+        raise HTTPException(status_code=404, detail="Oturum bulunamadı.") from None
     except HTTPException as exc:
         await log_agent(
             supabase,
             action="consult",
             status="error",
-            input_data=body.model_dump(mode="json"),
+            input_data={
+                **body.model_dump(mode="json"),
+                "account_id": principal.account_id,
+            },
             error_message=str(exc.detail),
             duration_ms=int((time.perf_counter() - started) * 1000),
             organization_id=body.organization_id,
+            account_id=principal.account_id,
         )
         raise
     except Exception as exc:
@@ -1127,22 +1180,40 @@ async def consult(body: ConsultRequest, request: Request) -> ConsultResponse:
             supabase,
             action="consult",
             status="error",
-            input_data=body.model_dump(mode="json"),
+            input_data={
+                **body.model_dump(mode="json"),
+                "account_id": principal.account_id,
+            },
             error_message=str(exc),
             duration_ms=int((time.perf_counter() - started) * 1000),
             organization_id=body.organization_id,
+            account_id=principal.account_id,
         )
         raise HTTPException(
             status_code=502,
             detail=f"Danışmanlık üretilemedi: {exc}",
         ) from exc
 
-    await _log_consult_success(supabase, body, response, started)
+    await _log_consult_success(
+        supabase, body, response, started, account_id=principal.account_id
+    )
     return response
 
 
 @app.post("/consult/stream")
 async def consult_stream(body: ConsultRequest, request: Request) -> StreamingResponse:
+    principal = require_principal(request)
+    if body.session_id:
+        try:
+            hydrate(
+                body.session_id,
+                None,
+                account_id=principal.account_id,
+                created_by_user_id=principal.user_id,
+                enforce_ownership=True,
+            )
+        except SessionAccessDenied:
+            raise HTTPException(status_code=404, detail="Oturum bulunamadı.") from None
     supabase = await get_supabase(request)
     http = get_http(request)
     started = time.perf_counter()
@@ -1160,23 +1231,34 @@ async def consult_stream(body: ConsultRequest, request: Request) -> StreamingRes
                     http,
                     supabase,
                     on_step=on_step,
-                    account_slug=getattr(request.state, "account_slug", None)
-                    or account_slug_from_headers(request.headers),
+                    account_slug=principal.account_slug,
+                    account_id=principal.account_id,
+                    user_id=principal.user_id,
                 )
                 result.context = await paywall_matches(
                     request, supabase, result.context
                 )
-                await _log_consult_success(supabase, body, result, started)
+                await _log_consult_success(
+                    supabase, body, result, started, account_id=principal.account_id
+                )
                 await queue.put(("complete", result.model_dump(mode="json")))
+            except SessionAccessDenied:
+                await queue.put(
+                    ("error", {"detail": "Oturum bulunamadı.", "status": 404})
+                )
             except HTTPException as exc:
                 await log_agent(
                     supabase,
                     action="consult",
                     status="error",
-                    input_data=body.model_dump(mode="json"),
+                    input_data={
+                        **body.model_dump(mode="json"),
+                        "account_id": principal.account_id,
+                    },
                     error_message=str(exc.detail),
                     duration_ms=int((time.perf_counter() - started) * 1000),
                     organization_id=body.organization_id,
+                    account_id=principal.account_id,
                 )
                 await queue.put(
                     ("error", {"detail": exc.detail, "status": exc.status_code})
@@ -1187,10 +1269,14 @@ async def consult_stream(body: ConsultRequest, request: Request) -> StreamingRes
                     supabase,
                     action="consult",
                     status="error",
-                    input_data=body.model_dump(mode="json"),
+                    input_data={
+                        **body.model_dump(mode="json"),
+                        "account_id": principal.account_id,
+                    },
                     error_message=str(exc),
                     duration_ms=int((time.perf_counter() - started) * 1000),
                     organization_id=body.organization_id,
+                    account_id=principal.account_id,
                 )
                 await queue.put(("error", {"detail": str(exc), "status": 502}))
             finally:
@@ -1222,24 +1308,26 @@ async def consult_stream(body: ConsultRequest, request: Request) -> StreamingRes
         },
     )
 
-
 @app.get("/agent-runs")
 async def list_agent_runs(
     request: Request,
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[dict[str, Any]]:
+    principal = require_principal(request)
     supabase = await get_supabase(request)
     try:
-        result = (
-            await supabase.table("agent_runs")
+        query = (
+            supabase.table("agent_runs")
             .select("*")
+            .eq("account_id", principal.account_id)
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        result = await query.execute()
         return result.data or []
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        # Column may be missing until migration — never return global rows.
+        return []
 
 
 def _consult_deps(
@@ -1248,7 +1336,8 @@ def _consult_deps(
     supabase: AsyncClient,
     session,
     *,
-    account_slug: str = "demo",
+    account_slug: str,
+    account_id: str = "",
 ) -> AgentDeps:
     question = body.question.strip()
     prior = session.history_dicts() if session is not None else []
@@ -1286,7 +1375,8 @@ def _consult_deps(
         match_count=body.match_count,
         match_threshold=body.match_threshold,
         session=session,
-        account_slug=account_slug or "demo",
+        account_slug=account_slug,
+        account_id=account_id or "",
         file_names=list(body.file_names or []),
     )
 
@@ -1337,17 +1427,33 @@ async def _run_consult_pipeline(
     http: httpx.AsyncClient,
     supabase: AsyncClient,
     on_step=None,
-    account_slug: str = "demo",
+    *,
+    account_slug: str,
+    account_id: str,
+    user_id: str,
 ) -> ConsultResponse:
     from agents.memory_store import persist_from_turn
 
-    session = hydrate(body.session_id, body.history)
-    slug = (account_slug or "demo").strip() or "demo"
+    session = hydrate(
+        body.session_id,
+        body.history,
+        account_id=account_id,
+        created_by_user_id=user_id,
+        enforce_ownership=True,
+    )
+    slug = account_slug.strip()
     assigned = bind_canary_model(session.session_id)
     with bind_session(session.session_id), reasoning_override(assigned):
         run_id, outcome = await run_orchestrator(
             question=body.question.strip(),
-            deps=_consult_deps(body, http, supabase, session, account_slug=slug),
+            deps=_consult_deps(
+                body,
+                http,
+                supabase,
+                session,
+                account_slug=slug,
+                account_id=account_id,
+            ),
             on_step=on_step,
         )
         session.last_intent = outcome.intent
@@ -1388,12 +1494,19 @@ async def _log_consult_success(
     body: ConsultRequest,
     response: ConsultResponse,
     started: float,
+    *,
+    account_id: str | None = None,
 ) -> None:
+    input_data = body.model_dump(mode="json")
+    if account_id:
+        input_data["account_id"] = account_id
+        if response.session_id:
+            input_data["session_id"] = response.session_id
     await log_agent(
         supabase,
         action="consult",
         status="success",
-        input_data=body.model_dump(mode="json"),
+        input_data=input_data,
         output_data={
             "question": response.question,
             "advice": response.advice,
@@ -1418,6 +1531,7 @@ async def _log_consult_success(
         },
         duration_ms=int((time.perf_counter() - started) * 1000),
         organization_id=body.organization_id,
+        account_id=account_id,
     )
 
 
@@ -1458,6 +1572,7 @@ async def list_organizations(
 
 @app.post("/trade-items")
 async def create_trade_item(body: TradeItemCreate, request: Request) -> dict[str, Any]:
+    principal = require_principal(request)
     supabase = await get_supabase(request)
     started = time.perf_counter()
     embedding_text = build_embedding_text(
@@ -1478,10 +1593,14 @@ async def create_trade_item(body: TradeItemCreate, request: Request) -> dict[str
             supabase,
             action="ingest_trade_item",
             status="error",
-            input_data=body.model_dump(mode="json"),
+            input_data={
+                **body.model_dump(mode="json"),
+                "account_id": principal.account_id,
+            },
             error_message=str(exc),
             duration_ms=int((time.perf_counter() - started) * 1000),
             organization_id=body.organization_id,
+            account_id=principal.account_id,
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1493,11 +1612,16 @@ async def create_trade_item(body: TradeItemCreate, request: Request) -> dict[str
         supabase,
         action="ingest_trade_item",
         status="success",
-        input_data={"product_name": body.product_name, "hs_code": body.hs_code},
+        input_data={
+            "product_name": body.product_name,
+            "hs_code": body.hs_code,
+            "account_id": principal.account_id,
+        },
         output_data={"id": created.get("id")},
         duration_ms=int((time.perf_counter() - started) * 1000),
         organization_id=body.organization_id,
         trade_item_id=UUID(created["id"]) if created.get("id") else None,
+        account_id=principal.account_id,
     )
     return created
 
@@ -1507,6 +1631,7 @@ async def bulk_create_trade_items(
     body: TradeItemBulkRequest,
     request: Request,
 ) -> TradeItemBulkResponse:
+    principal = require_principal(request)
     supabase = await get_supabase(request)
     http = get_http(request)
     started = time.perf_counter()
@@ -1530,9 +1655,14 @@ async def bulk_create_trade_items(
                     supabase,
                     action="ingest_trade_items_bulk",
                     status="error",
-                    input_data={"count": len(body.items), "failed_at_index": index},
+                    input_data={
+                        "count": len(body.items),
+                        "failed_at_index": index,
+                        "account_id": principal.account_id,
+                    },
                     error_message=str(exc.detail),
                     duration_ms=int((time.perf_counter() - started) * 1000),
+                    account_id=principal.account_id,
                 )
                 raise
             errors.append(
@@ -1561,9 +1691,14 @@ async def bulk_create_trade_items(
                 supabase,
                 action="ingest_trade_items_bulk",
                 status="error",
-                input_data={"count": len(body.items), "prepared": len(rows)},
+                input_data={
+                    "count": len(body.items),
+                    "prepared": len(rows),
+                    "account_id": principal.account_id,
+                },
                 error_message=str(exc),
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                account_id=principal.account_id,
             )
             raise HTTPException(
                 status_code=400,
@@ -1574,9 +1709,10 @@ async def bulk_create_trade_items(
         supabase,
         action="ingest_trade_items_bulk",
         status="success" if inserted and not errors else ("error" if not inserted else "success"),
-        input_data={"count": len(body.items)},
+        input_data={"count": len(body.items), "account_id": principal.account_id},
         output_data={"inserted": len(inserted), "failed": len(errors)},
         duration_ms=int((time.perf_counter() - started) * 1000),
+        account_id=principal.account_id,
     )
     return TradeItemBulkResponse(
         inserted=len(inserted),
@@ -1657,15 +1793,25 @@ async def list_suppliers(
 
 @app.post("/agent-logs")
 async def create_agent_log(body: AgentLogCreate, request: Request) -> dict[str, Any]:
+    principal = require_principal(request)
     supabase = await get_supabase(request)
     payload = body.model_dump(mode="json")
     for field in ("organization_id", "trade_item_id"):
         if payload.get(field):
             payload[field] = str(payload[field])
+    payload["account_id"] = principal.account_id
+    payload["input"] = {
+        **(payload.get("input") or {}),
+        "account_id": principal.account_id,
+    }
     try:
         result = await supabase.table("agent_logs").insert(payload).execute()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload.pop("account_id", None)
+        try:
+            result = await supabase.table("agent_logs").insert(payload).execute()
+        except Exception as exc2:
+            raise HTTPException(status_code=400, detail=str(exc2)) from exc2
     if not result.data:
         raise HTTPException(status_code=400, detail="Ajan kaydı oluşturulamadı.")
     return result.data[0]
@@ -1677,34 +1823,63 @@ async def list_agent_logs(
     limit: int = Query(default=50, ge=1, le=200),
     action: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
+    principal = require_principal(request)
     try:
         supabase = await asyncio.wait_for(
             get_supabase(request), timeout=HISTORY_FETCH_TIMEOUT_S
         )
-        query = supabase.table("agent_logs").select("*").order("created_at", desc=True)
+        query = (
+            supabase.table("agent_logs")
+            .select("*")
+            .eq("account_id", principal.account_id)
+            .order("created_at", desc=True)
+        )
         if action:
             query = query.eq("action", action)
-        result = await asyncio.wait_for(query.limit(limit).execute(), timeout=HISTORY_FETCH_TIMEOUT_S)
+        result = await asyncio.wait_for(
+            query.limit(limit).execute(), timeout=HISTORY_FETCH_TIMEOUT_S
+        )
         return result.data or []
     except Exception:
-        return []
+        # Prefer input.account_id filter if column missing.
+        try:
+            supabase = await get_supabase(request)
+            query = (
+                supabase.table("agent_logs")
+                .select("*")
+                .filter("input->>account_id", "eq", principal.account_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            if action:
+                query = query.eq("action", action)
+            result = await query.execute()
+            return result.data or []
+        except Exception:
+            return []
 
 
 @app.post("/consult/sessions")
-async def new_consult_session() -> dict[str, Any]:
-    """Yeni izole sohbet oturumu. Niyet ve kapasite bu id'ye aittir."""
-    state = create_session()
+async def new_consult_session(request: Request) -> dict[str, Any]:
+    """Yeni izole sohbet oturumu — authenticated account ownership."""
+    principal = require_principal(request)
+    state = create_session(
+        account_id=principal.account_id,
+        created_by_user_id=principal.user_id,
+    )
     return session_snapshot(state)
 
 
 @app.get("/consult/sessions")
-async def list_consult_sessions() -> list[dict[str, Any]]:
-    return list_sessions()
+async def list_consult_sessions(request: Request) -> list[dict[str, Any]]:
+    principal = require_principal(request)
+    return list_sessions(account_id=principal.account_id)
 
 
 @app.get("/consult/sessions/{session_id}")
-async def get_consult_session(session_id: str) -> dict[str, Any]:
-    state = get_session(session_id)
+async def get_consult_session(session_id: str, request: Request) -> dict[str, Any]:
+    principal = require_principal(request)
+    state = get_session_for_account(session_id, principal.account_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Oturum bulunamadı.")
     return session_snapshot(state)
@@ -1716,34 +1891,38 @@ async def remove_consult_session(
     request: Request,
 ) -> dict[str, Any]:
     """Sohbet oturumunu bellekten ve varsa ajan kayıtlarından siler."""
+    principal = require_principal(request)
     sid = (session_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="Oturum kimliği gerekli.")
-    deleted = delete_session(sid)
-    asyncio.create_task(_purge_consult_logs(request, sid))
+    deleted = delete_session(sid, account_id=principal.account_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Oturum bulunamadı.")
+    asyncio.create_task(
+        _purge_consult_logs(request, sid, account_id=principal.account_id)
+    )
     return {"ok": True, "session_id": sid, "deleted": deleted}
 
 
 HISTORY_FETCH_TIMEOUT_S = 8.0
 
 
-async def _purge_consult_logs(request: Request, session_id: str) -> None:
+async def _purge_consult_logs(
+    request: Request, session_id: str, *, account_id: str | None = None
+) -> None:
     try:
         supabase = await asyncio.wait_for(
             get_supabase(request), timeout=HISTORY_FETCH_TIMEOUT_S
         )
-        await asyncio.wait_for(
+        q = (
             supabase.table("agent_logs")
             .delete()
             .eq("action", "consult")
             .filter("input->>session_id", "eq", session_id)
-            .execute(),
-            timeout=HISTORY_FETCH_TIMEOUT_S,
         )
-        await asyncio.wait_for(
-            supabase.table("agent_logs").delete().eq("id", session_id).execute(),
-            timeout=HISTORY_FETCH_TIMEOUT_S,
-        )
+        if account_id:
+            q = q.eq("account_id", account_id)
+        await asyncio.wait_for(q.execute(), timeout=HISTORY_FETCH_TIMEOUT_S)
     except Exception:
         return
 
@@ -1752,6 +1931,7 @@ async def _fetch_consult_history(
     request: Request,
     limit: int,
 ) -> list[dict[str, Any]]:
+    principal = require_principal(request)
     try:
         supabase = await asyncio.wait_for(
             get_supabase(request), timeout=HISTORY_FETCH_TIMEOUT_S
@@ -1760,6 +1940,7 @@ async def _fetch_consult_history(
             supabase.table("agent_logs")
             .select("*")
             .eq("action", "consult")
+            .eq("account_id", principal.account_id)
             .order("created_at", desc=True)
             .limit(limit)
             .execute(),
@@ -1767,7 +1948,20 @@ async def _fetch_consult_history(
         )
         return result.data or []
     except Exception:
-        return []
+        try:
+            supabase = await get_supabase(request)
+            result = await (
+                supabase.table("agent_logs")
+                .select("*")
+                .eq("action", "consult")
+                .filter("input->>account_id", "eq", principal.account_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
+        except Exception:
+            return []
 
 
 @app.get("/consult/history")

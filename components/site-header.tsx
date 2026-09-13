@@ -3,7 +3,8 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { useEffect, useState } from "react"
-import { Radar } from "lucide-react"
+import { LogOut, Radar, UserRound } from "lucide-react"
+import { useAuth } from "@/components/auth-provider"
 import { QuotaMeter } from "@/components/quota-meter"
 import { getApiUrl, getHealth, type HealthResponse } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -14,14 +15,18 @@ export const NAV = [
   { href: "/firmalar", label: "Firmalar" },
   { href: "/gecmis", label: "Geçmiş" },
   { href: "/paket", label: "Paket" },
+  { href: "/hesap", label: "Hesap" },
 ]
 
 export function SiteHeader() {
   const pathname = usePathname()
+  const { status, signOut, account } = useAuth()
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [offline, setOffline] = useState(false)
+  const hideChrome = pathname === "/login"
 
   useEffect(() => {
+    if (hideChrome || status !== "authenticated") return
     let cancelled = false
 
     async function ping() {
@@ -45,7 +50,19 @@ export function SiteHeader() {
       cancelled = true
       clearInterval(id)
     }
-  }, [])
+  }, [hideChrome, status])
+
+  if (hideChrome) {
+    return (
+      <header className="sticky top-0 z-40 border-b border-white/8 bg-[#07131c]/85 pt-[env(safe-area-inset-top)] backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center px-4 py-3 sm:px-6">
+          <span className="font-heading text-base text-zinc-50">
+            World Trade Radar
+          </span>
+        </div>
+      </header>
+    )
+  }
 
   const ok = !offline && health?.status === "ok"
 
@@ -87,7 +104,28 @@ export function SiteHeader() {
 
         <div className="flex items-center gap-3">
           <QuotaMeter />
-          <div className="hidden items-center gap-2 text-xs text-zinc-400 sm:flex">
+          <Link
+            href="/hesap"
+            className="hidden items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 sm:flex"
+            title={account?.account_slug || "Hesap"}
+          >
+            <UserRound className="size-3.5" />
+            <span className="max-w-24 truncate">
+              {account?.account_slug || "Hesap"}
+            </span>
+          </Link>
+          <button
+            type="button"
+            onClick={() => {
+              void signOut()
+            }}
+            className="inline-flex min-h-9 items-center gap-1 rounded-md px-2 text-xs text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
+            aria-label="Çıkış"
+          >
+            <LogOut className="size-3.5" />
+            <span className="hidden md:inline">Çıkış</span>
+          </button>
+          <div className="hidden items-center gap-2 text-xs text-zinc-400 xl:flex">
             <span
               className={cn(
                 "size-1.5 rounded-full",
@@ -96,10 +134,7 @@ export function SiteHeader() {
                   : "bg-amber-400"
               )}
             />
-            <span className="hidden md:inline">
-              {offline ? "API çevrimdışı" : ok ? "API hazır" : "API kısmi"}
-            </span>
-            <span className="hidden font-mono text-[11px] text-zinc-600 xl:inline">
+            <span className="font-mono text-[11px] text-zinc-600">
               {getApiUrl().replace(/^https?:\/\//, "")}
             </span>
           </div>
